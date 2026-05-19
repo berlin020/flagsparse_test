@@ -233,4 +233,3 @@ def test_scatter_int64_strict_no_fallback(monkeypatch):
             dtype_policy="auto",
             index_fallback_policy="strict",
         )
-
