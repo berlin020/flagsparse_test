@@ -151,30 +151,45 @@ def _hipsparse_set_spmat_attribute(spmat, attr_name, enum_value):
 
 
 def _hipsparse_create_spsv_descr(handle):
-    create_fn = _hipsparse_call(
-        ("hipsparseSpSV_createDescr", "hipsparseCreateSpSVDescr"),
-        "hipsparseSpSV_createDescr",
-    )
-    try:
-        payload = _hip_check_result(create_fn(), "hipsparseSpSV_createDescr")
-        if payload is not None:
-            return payload
-    except TypeError:
-        pass
-
     ptr_type = type(handle)
-    descr = ptr_type()
-    attempts = []
-    if hasattr(descr, "createRef"):
-        attempts.append((descr.createRef(),))
-    attempts.append((descr,))
     last_error = None
-    for args in attempts:
+    status_only_success = False
+    for attr_name in ("hipsparseSpSV_createDescr", "hipsparseCreateSpSVDescr"):
+        create_fn = getattr(hipsparse, attr_name, None) if hipsparse is not None else None
+        if create_fn is None:
+            continue
         try:
-            _hip_check_result(create_fn(*args), "hipsparseSpSV_createDescr")
-            return descr
+            raw = create_fn()
+            if isinstance(raw, ptr_type) or hasattr(raw, "createRef"):
+                return raw
+            payload = _hip_check_result(raw, "hipsparseSpSV_createDescr")
+            if payload is not None:
+                return payload
+            status_only_success = True
+        except TypeError as exc:
+            last_error = exc
         except Exception as exc:
             last_error = exc
+
+        descr = ptr_type()
+        attempts = []
+        if hasattr(descr, "createRef"):
+            attempts.append((descr.createRef(),))
+        attempts.append((descr,))
+        for args in attempts:
+            try:
+                _hip_check_result(create_fn(*args), "hipsparseSpSV_createDescr")
+                return descr
+            except TypeError as exc:
+                last_error = exc
+            except Exception as exc:
+                last_error = exc
+
+    if status_only_success and last_error is None:
+        raise RuntimeError(
+            "hipsparseSpSV_createDescr succeeded without returning a descriptor, "
+            "and no compatible output-argument wrapper was found"
+        )
     raise RuntimeError(f"hipsparseSpSV_createDescr failed: {last_error}") from last_error
 
 
