@@ -728,6 +728,20 @@ def _cupy_spsolve_lower_csr_or_coo(
     lower,
 ):
     """Triangular solve via CuPy: CSR or COO storage. Returns (ms, x_torch) or (None, None)."""
+    if fs_spsv_impl._is_rocm_runtime():
+        sparse_ref = fs_spsv_impl._benchmark_spsv_csr_sparse_ref(
+            data,
+            indices,
+            indptr,
+            b,
+            shape,
+            lower=lower,
+            unit_diagonal=False,
+            op="non",
+            warmup=warmup,
+            iters=iters,
+        )
+        return sparse_ref["ms"], sparse_ref["values"]
     if (
         cp is None
         or cpx_sparse is None
@@ -778,6 +792,20 @@ def _cupy_spsolve_lower_csr_or_coo(
 
 
 def _cupy_spsolve_csr_with_op(data, indices, indptr, shape, b, op_mode, lower):
+    if fs_spsv_impl._is_rocm_runtime():
+        sparse_ref = fs_spsv_impl._benchmark_spsv_csr_sparse_ref(
+            data,
+            indices,
+            indptr,
+            b,
+            shape,
+            lower=lower,
+            unit_diagonal=False,
+            op=op_mode,
+            warmup=WARMUP,
+            iters=ITERS,
+        )
+        return sparse_ref["ms"], sparse_ref["values"]
     if (
         cp is None
         or cpx_sparse is None

@@ -186,6 +186,19 @@ def _benchmark_pytorch_reference(data, indices, indptr, shape, B):
 
 
 def _benchmark_cusparse_reference(data, row, col, indptr, B, shape, fmt, warmup, iters):
+    if fs_spsm_impl._is_rocm_runtime():
+        sparse_ref = fs_spsm_impl._benchmark_spsm_csr_sparse_ref(
+            data,
+            col,
+            indptr,
+            B,
+            shape,
+            lower=True,
+            unit_diagonal=False,
+            warmup=warmup,
+            iters=iters,
+        )
+        return sparse_ref["values"], sparse_ref["ms"], sparse_ref["reason"]
     if cp is None or cpx_sparse is None or cpx_cusparse is None:
         return None, None, "cusparse unavailable"
     try:

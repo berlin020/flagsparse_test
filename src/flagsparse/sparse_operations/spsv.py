@@ -1,5 +1,8 @@
 """Sparse triangular solve (SpSV) CSR/COO."""
 
+import ctypes
+
+from . import _common as _common_mod
 from ._common import *
 
 from collections import OrderedDict
@@ -9,6 +12,18 @@ import os
 import time
 import triton
 import triton.language as tl
+
+hip = _common_mod.hip
+hipsparse = _common_mod.hipsparse
+HipPointer = _common_mod.HipPointer
+_benchmark_prepared_cuda_op = _common_mod._benchmark_prepared_cuda_op
+_hip_check_result = _common_mod._hip_check_result
+_hipsparse_lookup = _common_mod._hipsparse_lookup
+_hipsparse_unavailable_reason = _common_mod._hipsparse_unavailable_reason
+_hipsparse_value_type = _common_mod._hipsparse_value_type
+_hipsparse_scalar = _common_mod._hipsparse_scalar
+_hipsparse_index_type = _common_mod._hipsparse_index_type
+_hipsparse_spmv_operation = _common_mod._hipsparse_spmv_operation
 
 SUPPORTED_SPSV_VALUE_DTYPES = (
     torch.float32,
@@ -50,6 +65,206 @@ SPSV_PROMOTE_TRANSPOSE_COMPLEX64_TO_COMPLEX128 = _spsv_env_flag(
 )
 _SPSV_CSR_PREPROCESS_CACHE = OrderedDict()
 _SPSV_CSR_PREPROCESS_CACHE_SIZE = 8
+
+
+def _hipsparse_spsv_op(op):
+    return _hipsparse_spmv_operation(op, "hipSPARSE CSR SpSV")
+
+
+def _hipsparse_spsv_alg():
+    return _hipsparse_lookup(
+        "hipsparseSpSVAlg_t",
+        (
+            "HIPSPARSE_SPSV_ALG_DEFAULT",
+            "HIPSPARSE_SPSV_CSR_ALG1",
+        ),
+    )
+
+
+def _hipsparse_spmat_attribute(name):
+    mapping = {
+        "fill_mode": ("HIPSPARSE_SPMAT_FILL_MODE",),
+        "diag_type": ("HIPSPARSE_SPMAT_DIAG_TYPE",),
+    }
+    if name not in mapping:
+        raise RuntimeError(f"Unsupported hipSPARSE SpMat attribute: {name}")
+    return _hipsparse_lookup("hipsparseSpMatAttribute_t", mapping[name])
+
+
+def _hipsparse_fill_mode_enum(lower):
+    return _hipsparse_lookup(
+        "hipsparseFillMode_t",
+        ("HIPSPARSE_FILL_MODE_LOWER",)
+        if lower
+        else ("HIPSPARSE_FILL_MODE_UPPER",),
+    )
+
+
+def _hipsparse_diag_type_enum(unit_diagonal):
+    return _hipsparse_lookup(
+        "hipsparseDiagType_t",
+        ("HIPSPARSE_DIAG_TYPE_UNIT",)
+        if unit_diagonal
+        else ("HIPSPARSE_DIAG_TYPE_NON_UNIT",),
+    )
+
+
+def _hipsparse_call(attr_names, context):
+    for attr_name in attr_names:
+        fn = getattr(hipsparse, attr_name, None) if hipsparse is not None else None
+        if fn is not None:
+            return fn
+    names = ", ".join(attr_names)
+    raise RuntimeError(f"{context} is unavailable: missing {names}")
+
+
+def _hipsparse_enum_storage(enum_value):
+    try:
+        raw_value = int(enum_value)
+    except Exception:
+        raw_value = getattr(enum_value, "value", enum_value)
+    return ctypes.c_int(int(raw_value))
+
+
+def _hipsparse_set_spmat_attribute(spmat, attr_name, enum_value):
+    setter = _hipsparse_call(
+        ("hipsparseSpMatSetAttribute",),
+        "hipsparseSpMatSetAttribute",
+    )
+    attr = _hipsparse_spmat_attribute(attr_name)
+    payload = _hipsparse_enum_storage(enum_value)
+    attempts = (
+        (spmat, attr, payload, ctypes.sizeof(payload)),
+        (spmat, attr, ctypes.byref(payload), ctypes.sizeof(payload)),
+        (spmat, attr, enum_value, ctypes.sizeof(payload)),
+    )
+    last_error = None
+    for args in attempts:
+        try:
+            _hip_check_result(setter(*args), "hipsparseSpMatSetAttribute")
+            return
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(
+        f"hipsparseSpMatSetAttribute({attr_name}) failed: {last_error}"
+    ) from last_error
+
+
+def _hipsparse_create_spsv_descr(handle):
+    create_fn = _hipsparse_call(
+        ("hipsparseSpSV_createDescr", "hipsparseCreateSpSVDescr"),
+        "hipsparseSpSV_createDescr",
+    )
+    try:
+        payload = _hip_check_result(create_fn(), "hipsparseSpSV_createDescr")
+        if payload is not None:
+            return payload
+    except TypeError:
+        pass
+
+    ptr_type = type(handle)
+    descr = ptr_type()
+    attempts = []
+    if hasattr(descr, "createRef"):
+        attempts.append((descr.createRef(),))
+    attempts.append((descr,))
+    last_error = None
+    for args in attempts:
+        try:
+            _hip_check_result(create_fn(*args), "hipsparseSpSV_createDescr")
+            return descr
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"hipsparseSpSV_createDescr failed: {last_error}") from last_error
+
+
+def _hipsparse_destroy_spsv_descr(descr):
+    if descr is None:
+        return
+    destroy_fn = _hipsparse_call(
+        ("hipsparseSpSV_destroyDescr", "hipsparseDestroySpSVDescr"),
+        "hipsparseSpSV_destroyDescr",
+    )
+    _hip_check_result(destroy_fn(descr), "hipsparseSpSV_destroyDescr")
+
+
+def _hipsparse_spsv_skip_reason(
+    value_dtype,
+    index_dtype,
+    indptr_dtype=None,
+    *,
+    op="non",
+):
+    indptr_dtype = index_dtype if indptr_dtype is None else indptr_dtype
+    if not _is_rocm_runtime():
+        return "hipSPARSE CSR SpSV reference requires a ROCm runtime"
+    unavailable_reason = _hipsparse_unavailable_reason()
+    if unavailable_reason is not None:
+        return unavailable_reason
+    required_symbols = (
+        "hipsparseCreate",
+        "hipsparseDestroy",
+        "hipsparseCreateCsr",
+        "hipsparseCreateDnVec",
+        "hipsparseDestroyDnVec",
+        "hipsparseDestroySpMat",
+        "hipsparseSpMatSetAttribute",
+        "hipsparseSpSV_bufferSize",
+        "hipsparseSpSV_analysis",
+        "hipsparseSpSV_solve",
+    )
+    for symbol in required_symbols:
+        if not hasattr(hipsparse, symbol):
+            return f"hipSPARSE CSR SpSV direct API is unavailable: missing {symbol}"
+    if not any(
+        hasattr(hipsparse, name)
+        for name in ("hipsparseSpSV_createDescr", "hipsparseCreateSpSVDescr")
+    ):
+        return "hipSPARSE CSR SpSV direct API is unavailable: missing descriptor create API"
+    if not any(
+        hasattr(hipsparse, name)
+        for name in ("hipsparseSpSV_destroyDescr", "hipsparseDestroySpSVDescr")
+    ):
+        return "hipSPARSE CSR SpSV direct API is unavailable: missing descriptor destroy API"
+    if value_dtype not in SUPPORTED_SPSV_VALUE_DTYPES:
+        return f"hipSPARSE CSR SpSV has no supported value dtype mapping for {value_dtype}"
+    if index_dtype not in SUPPORTED_SPSV_INDEX_DTYPES:
+        return f"hipSPARSE CSR SpSV has no supported index dtype mapping for {index_dtype}"
+    if indptr_dtype not in SUPPORTED_SPSV_INDEX_DTYPES:
+        return f"hipSPARSE CSR SpSV has no supported row offset dtype mapping for {indptr_dtype}"
+    try:
+        _validate_spsv_non_trans_combo(value_dtype, index_dtype, "CSR")
+        _validate_spsv_trans_combo(value_dtype, index_dtype, "CSR")
+        _ = _hipsparse_value_type(value_dtype)
+        _ = _hipsparse_scalar(value_dtype, 1.0, 0.0)
+        _ = _hipsparse_index_type(index_dtype, "hipSPARSE CSR SpSV column indices")
+        _ = _hipsparse_index_type(indptr_dtype, "hipSPARSE CSR SpSV row offsets")
+        _ = _hipsparse_spsv_op(op)
+        _ = _hipsparse_spsv_alg()
+        _ = _hipsparse_fill_mode_enum(True)
+        _ = _hipsparse_fill_mode_enum(False)
+        _ = _hipsparse_diag_type_enum(False)
+        _ = _hipsparse_diag_type_enum(True)
+        _ = _hipsparse_spmat_attribute("fill_mode")
+        _ = _hipsparse_spmat_attribute("diag_type")
+    except Exception as exc:
+        return str(exc)
+    return None
+
+
+def _spsv_csr_sparse_ref_backend(value_dtype, index_dtype, indptr_dtype=None, op="non"):
+    indptr_dtype = index_dtype if indptr_dtype is None else indptr_dtype
+    if _is_rocm_runtime():
+        reason = _hipsparse_spsv_skip_reason(
+            value_dtype,
+            index_dtype,
+            indptr_dtype,
+            op=op,
+        )
+        if reason is None:
+            return "hipsparse", None
+        return None, reason
+    return None, "direct hipSPARSE CSR SpSV reference requires a ROCm runtime"
 
 
 @dataclass
@@ -257,6 +472,423 @@ def _normalize_spsv_transpose_mode(transpose):
         "transpose must be bool or one of: "
         "N/NON/NON_TRANS, T/TRANS, C/H/CONJ/CONJ_TRANS/CONJUGATE_TRANSPOSE"
     )
+
+
+def _prepare_spsv_csr_ref_hipsparse(
+    data,
+    indices,
+    indptr,
+    rhs,
+    shape,
+    *,
+    lower=True,
+    unit_diagonal=False,
+    op="non",
+    out=None,
+):
+    op_name = _normalize_sparse_reference_op(op)
+    skip_reason = _hipsparse_spsv_skip_reason(
+        data.dtype,
+        indices.dtype,
+        indptr.dtype,
+        op=op_name,
+    )
+    if skip_reason is not None:
+        raise RuntimeError(skip_reason)
+    if not all(torch.is_tensor(t) for t in (data, indices, indptr, rhs)):
+        raise TypeError("data, indices, indptr, rhs must all be torch.Tensor")
+    if not all(t.is_cuda for t in (data, indices, indptr, rhs)):
+        raise ValueError("data, indices, indptr, rhs must all be CUDA tensors")
+    if not all(t.device == data.device for t in (indices, indptr, rhs)):
+        raise ValueError("data, indices, indptr, rhs must be on the same CUDA device")
+    if data.ndim != 1 or indices.ndim != 1 or indptr.ndim != 1 or rhs.ndim != 1:
+        raise ValueError("data, indices, indptr, rhs must all be 1D tensors")
+    if indices.numel() != data.numel():
+        raise ValueError("data and indices must have the same length")
+
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    if n_rows != n_cols:
+        raise ValueError(f"hipSPARSE CSR SpSV reference expects a square matrix, got {shape}")
+    if indptr.numel() != n_rows + 1:
+        raise ValueError(f"indptr length must be n_rows+1={n_rows + 1}")
+    rhs_size = n_rows if op_name == "non" else n_cols
+    if rhs.numel() != rhs_size:
+        raise ValueError(f"rhs length must be {rhs_size} for op={op_name}")
+
+    data = data.contiguous()
+    indices = indices.contiguous()
+    indptr = indptr.contiguous()
+    rhs = rhs.contiguous()
+    value_type = _hipsparse_value_type(data.dtype)
+    alpha = _hipsparse_scalar(data.dtype, 1.0, 0.0)
+    row_index_type = _hipsparse_index_type(
+        indptr.dtype, "hipSPARSE CSR SpSV row offsets"
+    )
+    col_index_type = _hipsparse_index_type(
+        indices.dtype, "hipSPARSE CSR SpSV column indices"
+    )
+    op_enum = _hipsparse_spsv_op(op_name)
+    alg = _hipsparse_spsv_alg()
+    fill_mode = _hipsparse_fill_mode_enum(lower)
+    diag_type = _hipsparse_diag_type_enum(unit_diagonal)
+
+    solution = out
+    if solution is None:
+        solution = torch.empty_like(rhs)
+    else:
+        if not torch.is_tensor(solution):
+            raise TypeError("out must be a torch.Tensor")
+        if not solution.is_cuda or solution.device != data.device:
+            raise ValueError("out must be a CUDA tensor on the same device as data")
+        if solution.dtype != data.dtype or solution.shape != rhs.shape:
+            raise ValueError("out must match the solution shape and dtype")
+        if not solution.is_contiguous():
+            raise ValueError("out must be contiguous")
+
+    if rhs.numel() == 0:
+        return {
+            "backend": "hipsparse",
+            "buffer_size": 0,
+            "format": "csr",
+            "solution": solution,
+            "empty": True,
+        }
+
+    handle = None
+    spmat = None
+    rhs_desc = None
+    sol_desc = None
+    spsv_descr = None
+    workspace = 0
+    workspace_allocated = False
+    try:
+        handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
+        ptr_type = type(handle)
+
+        # hip-python descriptor outputs need createRef() so the wrapper can write back.
+        spmat = ptr_type()
+        rhs_desc = ptr_type()
+        sol_desc = ptr_type()
+        spmat_ref = spmat.createRef()
+        rhs_desc_ref = rhs_desc.createRef()
+        sol_desc_ref = sol_desc.createRef()
+
+        # Sparse/dense descriptors are most reliable when fed tensor.data_ptr() wrappers.
+        row_ptr = HipPointer.fromObj(indptr.data_ptr())
+        col_ptr = HipPointer.fromObj(indices.data_ptr())
+        values_ptr = HipPointer.fromObj(data.data_ptr())
+        rhs_ptr = HipPointer.fromObj(rhs.data_ptr())
+        sol_ptr = HipPointer.fromObj(solution.data_ptr())
+
+        index_base = _hipsparse_lookup(
+            "hipsparseIndexBase_t",
+            ("HIPSPARSE_INDEX_BASE_ZERO",),
+        )
+        _hip_check_result(
+            hipsparse.hipsparseCreateCsr(
+                spmat_ref,
+                n_rows,
+                n_cols,
+                int(data.numel()),
+                row_ptr,
+                col_ptr,
+                values_ptr,
+                row_index_type,
+                col_index_type,
+                index_base,
+                value_type,
+            ),
+            "hipsparseCreateCsr",
+        )
+        _hipsparse_set_spmat_attribute(spmat, "fill_mode", fill_mode)
+        _hipsparse_set_spmat_attribute(spmat, "diag_type", diag_type)
+        _hip_check_result(
+            hipsparse.hipsparseCreateDnVec(rhs_desc_ref, rhs_size, rhs_ptr, value_type),
+            "hipsparseCreateDnVec(rhs)",
+        )
+        _hip_check_result(
+            hipsparse.hipsparseCreateDnVec(sol_desc_ref, rhs_size, sol_ptr, value_type),
+            "hipsparseCreateDnVec(solution)",
+        )
+        spsv_descr = _hipsparse_create_spsv_descr(handle)
+
+        buffer_size_fn = _hipsparse_call(
+            ("hipsparseSpSV_bufferSize",),
+            "hipsparseSpSV_bufferSize",
+        )
+        analysis_fn = _hipsparse_call(
+            ("hipsparseSpSV_analysis",),
+            "hipsparseSpSV_analysis",
+        )
+        size_out = ctypes.c_size_t()
+        # alpha is passed directly as a ctypes scalar, not ctypes.byref(alpha).
+        _hip_check_result(
+            buffer_size_fn(
+                handle,
+                op_enum,
+                alpha,
+                spmat,
+                rhs_desc,
+                sol_desc,
+                value_type,
+                alg,
+                spsv_descr,
+                size_out,
+            ),
+            "hipsparseSpSV_bufferSize",
+        )
+        buffer_size = int(size_out.value)
+        if buffer_size > 0:
+            workspace = _hip_check_result(hip.hipMalloc(buffer_size), "hipMalloc")
+            workspace_allocated = True
+        else:
+            workspace = 0
+        _hip_check_result(
+            analysis_fn(
+                handle,
+                op_enum,
+                alpha,
+                spmat,
+                rhs_desc,
+                sol_desc,
+                value_type,
+                alg,
+                spsv_descr,
+                workspace,
+            ),
+            "hipsparseSpSV_analysis",
+        )
+        return {
+            "backend": "hipsparse",
+            "buffer_size": buffer_size,
+            "format": "csr",
+            "handle": handle,
+            "spmat": spmat,
+            "rhs_desc": rhs_desc,
+            "sol_desc": sol_desc,
+            "spsv_descr": spsv_descr,
+            "workspace": workspace,
+            "workspace_allocated": workspace_allocated,
+            "op_enum": op_enum,
+            "alpha": alpha,
+            "value_type": value_type,
+            "alg": alg,
+            "solution": solution,
+            "empty": False,
+        }
+    finally:
+        if handle is None and spsv_descr is not None:
+            try:
+                _hipsparse_destroy_spsv_descr(spsv_descr)
+            except Exception:
+                pass
+        if handle is None and sol_desc is not None:
+            try:
+                _hip_check_result(
+                    hipsparse.hipsparseDestroyDnVec(sol_desc),
+                    "hipsparseDestroyDnVec(solution)",
+                )
+            except Exception:
+                pass
+        if handle is None and rhs_desc is not None:
+            try:
+                _hip_check_result(
+                    hipsparse.hipsparseDestroyDnVec(rhs_desc),
+                    "hipsparseDestroyDnVec(rhs)",
+                )
+            except Exception:
+                pass
+        if handle is None and spmat is not None:
+            try:
+                _hip_check_result(
+                    hipsparse.hipsparseDestroySpMat(spmat),
+                    "hipsparseDestroySpMat",
+                )
+            except Exception:
+                pass
+        if handle is None and workspace_allocated:
+            try:
+                _hip_check_result(hip.hipFree(workspace), "hipFree")
+            except Exception:
+                pass
+
+
+def _run_spsv_csr_ref_hipsparse_prepared(state):
+    if state.get("empty"):
+        return state["solution"]
+    solve_fn = _hipsparse_call(
+        ("hipsparseSpSV_solve",),
+        "hipsparseSpSV_solve",
+    )
+    attempts = (
+        (
+            state["handle"],
+            state["op_enum"],
+            state["alpha"],
+            state["spmat"],
+            state["rhs_desc"],
+            state["sol_desc"],
+            state["value_type"],
+            state["alg"],
+            state["spsv_descr"],
+        ),
+        (
+            state["handle"],
+            state["op_enum"],
+            state["alpha"],
+            state["spmat"],
+            state["rhs_desc"],
+            state["sol_desc"],
+            state["value_type"],
+            state["alg"],
+            state["spsv_descr"],
+            state["workspace"],
+        ),
+    )
+    last_error = None
+    for args in attempts:
+        try:
+            _hip_check_result(solve_fn(*args), "hipsparseSpSV_solve")
+            return state["solution"]
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"hipsparseSpSV_solve failed: {last_error}") from last_error
+
+
+def _destroy_spsv_csr_ref_hipsparse_prepared(state):
+    spsv_descr = state.get("spsv_descr")
+    sol_desc = state.get("sol_desc")
+    rhs_desc = state.get("rhs_desc")
+    spmat = state.get("spmat")
+    workspace_allocated = bool(state.get("workspace_allocated"))
+    workspace = state.get("workspace", 0)
+    handle = state.get("handle")
+    if spsv_descr is not None:
+        try:
+            _hipsparse_destroy_spsv_descr(spsv_descr)
+        except Exception:
+            pass
+    if sol_desc is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroyDnVec(sol_desc),
+                "hipsparseDestroyDnVec(solution)",
+            )
+        except Exception:
+            pass
+    if rhs_desc is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroyDnVec(rhs_desc),
+                "hipsparseDestroyDnVec(rhs)",
+            )
+        except Exception:
+            pass
+    if spmat is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroySpMat(spmat),
+                "hipsparseDestroySpMat",
+            )
+        except Exception:
+            pass
+    if workspace_allocated:
+        try:
+            _hip_check_result(hip.hipFree(workspace), "hipFree")
+        except Exception:
+            pass
+    if handle is not None:
+        try:
+            _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+        except Exception:
+            pass
+
+
+def _spsv_csr_ref_hipsparse(
+    data,
+    indices,
+    indptr,
+    rhs,
+    shape,
+    *,
+    lower=True,
+    unit_diagonal=False,
+    op="non",
+    out=None,
+    return_metadata=False,
+):
+    state = _prepare_spsv_csr_ref_hipsparse(
+        data,
+        indices,
+        indptr,
+        rhs,
+        shape,
+        lower=lower,
+        unit_diagonal=unit_diagonal,
+        op=op,
+        out=out,
+    )
+    try:
+        solution = _run_spsv_csr_ref_hipsparse_prepared(state)
+        metadata = {
+            "backend": "hipsparse",
+            "buffer_size": int(state.get("buffer_size", 0)),
+            "format": "csr",
+        }
+        if return_metadata:
+            return solution, metadata
+        return solution
+    finally:
+        _destroy_spsv_csr_ref_hipsparse_prepared(state)
+
+
+def _benchmark_spsv_csr_sparse_ref(
+    data,
+    indices,
+    indptr,
+    rhs,
+    shape,
+    *,
+    lower=True,
+    unit_diagonal=False,
+    op="non",
+    warmup=0,
+    iters=1,
+):
+    backend, reason = _spsv_csr_sparse_ref_backend(
+        data.dtype,
+        indices.dtype,
+        indptr.dtype,
+        op=op,
+    )
+    result = {
+        "backend": backend,
+        "values": None,
+        "ms": None,
+        "reason": reason,
+    }
+    if backend is None:
+        return result
+    values, ms = _benchmark_prepared_cuda_op(
+        lambda: _prepare_spsv_csr_ref_hipsparse(
+            data,
+            indices,
+            indptr,
+            rhs,
+            shape,
+            lower=lower,
+            unit_diagonal=unit_diagonal,
+            op=op,
+        ),
+        _run_spsv_csr_ref_hipsparse_prepared,
+        _destroy_spsv_csr_ref_hipsparse_prepared,
+        warmup=warmup,
+        iters=iters,
+    )
+    result["values"] = values
+    result["ms"] = ms
+    result["reason"] = None
+    return result
 
 
 def _prepare_spsv_inputs(data, indices, indptr, b, shape):
