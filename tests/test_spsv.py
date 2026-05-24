@@ -424,67 +424,66 @@ def _csr_transpose(data, indices, indptr, shape, conjugate=False):
 def _load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None, lower=True):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    with open(file_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    data_lines = []
     header_info = None
     mm_field = "real"
     mm_symmetry = "general"
-    for line in lines:
-        line = line.strip()
-        if line.startswith("%%MatrixMarket"):
-            parts = line.split()
-            if len(parts) >= 5:
-                mm_field = parts[3].lower()
-                mm_symmetry = parts[4].lower()
-            continue
-        if line.startswith("%"):
-            continue
-        if not header_info and line:
-            parts = line.split()
-            n_rows = int(parts[0])
-            n_cols = int(parts[1])
-            nnz = int(parts[2]) if len(parts) > 2 else 0
-            header_info = (n_rows, n_cols, nnz)
-            continue
-        if line:
-            data_lines.append(line)
-    if header_info is None:
-        raise ValueError(f"Cannot parse .mtx header: {file_path}")
-    n_rows, n_cols, nnz = header_info
-    if n_rows != n_cols:
-        raise ValueError("SpSV requires square matrices")
-    row_maps = [dict() for _ in range(n_rows)]
+    row_maps = None
 
-    def _accum(r, c, v):
-        row = row_maps[r]
+    def _accum_tri(row_maps_local, r, c, v):
+        keep = c < r if lower else c > r
+        if not keep:
+            return
+        row = row_maps_local[r]
         row[c] = row.get(c, 0.0) + v
 
-    for line in data_lines[:nnz]:
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        r = int(parts[0]) - 1
-        c = int(parts[1]) - 1
-        v = _matrix_market_value(parts, mm_field)
-        _accum(r, c, v)
-        if mm_symmetry == "symmetric" and r != c:
-            _accum(c, r, v)
-        elif mm_symmetry == "hermitian" and r != c:
-            _accum(c, r, v.conjugate() if isinstance(v, complex) else v)
-        elif mm_symmetry == "skew-symmetric" and r != c:
-            _accum(c, r, -v)
+    with open(file_path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if line.startswith("%%MatrixMarket"):
+                parts = line.split()
+                if len(parts) >= 5:
+                    mm_field = parts[3].lower()
+                    mm_symmetry = parts[4].lower()
+                continue
+            if line.startswith("%"):
+                continue
+            if not header_info and line:
+                parts = line.split()
+                n_rows = int(parts[0])
+                n_cols = int(parts[1])
+                nnz = int(parts[2]) if len(parts) > 2 else 0
+                header_info = (n_rows, n_cols, nnz)
+                if n_rows != n_cols:
+                    raise ValueError("SpSV requires square matrices")
+                row_maps = [dict() for _ in range(n_rows)]
+                continue
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            r = int(parts[0]) - 1
+            c = int(parts[1]) - 1
+            v = _matrix_market_value(parts, mm_field)
+            _accum_tri(row_maps, r, c, v)
+            if mm_symmetry == "symmetric" and r != c:
+                _accum_tri(row_maps, c, r, v)
+            elif mm_symmetry == "hermitian" and r != c:
+                _accum_tri(
+                    row_maps,
+                    c,
+                    r,
+                    v.conjugate() if isinstance(v, complex) else v,
+                )
+            elif mm_symmetry == "skew-symmetric" and r != c:
+                _accum_tri(row_maps, c, r, -v)
 
-    tri_rows = [dict() for _ in range(n_rows)]
+    if header_info is None:
+        raise ValueError(f"Cannot parse .mtx header: {file_path}")
+    n_rows, n_cols, _nnz = header_info
     row_off_abs = [0.0] * n_rows
     col_off_abs = [0.0] * n_cols
-    for r in range(n_rows):
-        for c, v in row_maps[r].items():
-            keep = c < r if lower else c > r
-            if keep:
-                tri_rows[r][c] = tri_rows[r].get(c, 0.0) + v
-
-    for r, row in enumerate(tri_rows):
+    for r, row in enumerate(row_maps):
         for c, v in row.items():
             mag = abs(v)
             row_off_abs[r] += mag
@@ -492,10 +491,9 @@ def _load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None, lower=Tr
 
     for r in range(n_rows):
         # Make the generated triangular system stable for both A and op(A).
-        tri_rows[r][r] = (
+        row_maps[r][r] = (
             SPSV_TRIANGULAR_DIAG_DOMINANCE * max(row_off_abs[r], col_off_abs[r]) + 1.0
         )
-    row_maps = tri_rows
 
     cols_s = []
     vals_s = []
@@ -1388,6 +1386,12 @@ def run_all_supported_spsv_csr_csv(
                 print("-" * 150)
                 for path in mtx_paths:
                     try:
+                        print(
+                            f"RUNNING: {os.path.basename(path)} | "
+                            f"dtype={_dtype_name(value_dtype)} | "
+                            f"index={_dtype_name(index_dtype)} | fmt=csr | opA={op_mode}",
+                            flush=True,
+                        )
                         row, pt_skip = _run_one_csv_row_csr_full(
                             path, value_dtype, index_dtype, op_mode, device, lower=lower, alg_num=alg_num
                         )
@@ -1556,6 +1560,12 @@ def run_all_dtypes_spsv_coo_csv(
                 print("-" * 150)
                 for path in mtx_paths:
                     try:
+                        print(
+                            f"RUNNING: {os.path.basename(path)} | "
+                            f"dtype={_dtype_name(value_dtype)} | "
+                            f"index={_dtype_name(index_dtype)} | fmt=coo | opA={op_mode}",
+                            flush=True,
+                        )
                         row, pt_skip = _run_one_csv_row_coo(
                             path, value_dtype, index_dtype, op_mode, device, lower=lower, alg_num=alg_num
                         )

@@ -608,24 +608,29 @@ def _benchmark_spsm_csr_sparse_ref(
     }
     if backend is None:
         return result
-    values, ms = _benchmark_prepared_cuda_op(
-        lambda: _prepare_spsm_csr_ref_hipsparse(
-            data,
-            indices,
-            indptr,
-            B,
-            shape,
-            lower=lower,
-            unit_diagonal=unit_diagonal,
-        ),
-        _run_spsm_csr_ref_hipsparse_prepared,
-        _destroy_spsm_csr_ref_hipsparse_prepared,
-        warmup=warmup,
-        iters=iters,
-    )
-    result["values"] = values
-    result["ms"] = ms
-    result["reason"] = None
+    try:
+        values, ms = _benchmark_prepared_cuda_op(
+            lambda: _prepare_spsm_csr_ref_hipsparse(
+                data,
+                indices,
+                indptr,
+                B,
+                shape,
+                lower=lower,
+                unit_diagonal=unit_diagonal,
+            ),
+            _run_spsm_csr_ref_hipsparse_prepared,
+            _destroy_spsm_csr_ref_hipsparse_prepared,
+            warmup=warmup,
+            iters=iters,
+        )
+        result["values"] = values
+        result["ms"] = ms
+        result["reason"] = None
+    except Exception as exc:
+        result["values"] = None
+        result["ms"] = None
+        result["reason"] = str(exc)
     return result
 
 
