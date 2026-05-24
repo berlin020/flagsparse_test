@@ -56,6 +56,7 @@ def _hipsparse_create_spsm_descr(handle):
         create_fn = getattr(hipsparse, attr_name, None) if hipsparse is not None else None
         if create_fn is None:
             continue
+        no_arg_succeeded = False
         try:
             raw = create_fn()
             if isinstance(raw, ptr_type) or hasattr(raw, "createRef"):
@@ -64,10 +65,14 @@ def _hipsparse_create_spsm_descr(handle):
             if payload is not None:
                 return payload
             status_only_success = True
+            no_arg_succeeded = True
         except TypeError as exc:
             last_error = exc
         except Exception as exc:
             last_error = exc
+
+        if no_arg_succeeded:
+            continue
 
         descr = ptr_type()
         attempts = []
