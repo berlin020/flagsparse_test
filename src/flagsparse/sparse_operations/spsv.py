@@ -1389,20 +1389,17 @@ def _prepare_spsv_csr_system(
     storage_view = _normalize_spsv_storage_view(storage_view)
     if storage_view != "csr_as_csc":
         raise ValueError("TRANS/CONJ SpSV only supports storage_view='csr_as_csc'")
-    data_eff = data
-    indices_eff64 = indices64
-    indptr_eff64 = indptr64
-    matrix_stats = _build_spsv_cw_matrix_stats(indptr_eff64, n_rows)
+    matrix_stats = _build_spsv_cw_matrix_stats(indptr64, n_rows)
     default_block_nnz, default_max_segments = _choose_transpose_family_launch_config(
-        indptr_eff64
+        indptr64
     )
     cw_plan = {
         "solve_kind": "transpose_cw",
         "default_solve_kind": "transpose_cw",
         "supported_solve_kinds": ("transpose_cw",),
-        "kernel_data": data_eff,
-        "kernel_indices32": indices_eff64.to(torch.int32),
-        "kernel_indptr64": indptr_eff64,
+        "kernel_data": data,
+        "kernel_indices32": indices64.to(torch.int32),
+        "kernel_indptr64": indptr64,
         "lower_eff": lower_eff,
         "default_block_nnz": default_block_nnz,
         "default_max_segments": default_max_segments,
@@ -3217,7 +3214,9 @@ def _triton_spsv_csr_transpose_cw_vector_complex(
             indptr, block_nnz=block_nnz, max_segments=max_segments
         )
 
-    residual_work = residual_in if residual_in is not None else b_vec.contiguous().clone()
+    residual_work = (
+        residual_in if residual_in is not None else b_vec.contiguous().clone()
+    )
     indegree = (
         indegree_in
         if indegree_in is not None
@@ -3536,6 +3535,51 @@ def flagsparse_spsv_analysis_csr(
     )
 
 
+def _analyze_spsv_csr(
+    data,
+    indices,
+    indptr,
+    b,
+    shape,
+    lower=True,
+    unit_diagonal=False,
+    transpose=False,
+    solve_kind=None,
+    clear_cache=False,
+    return_time=False,
+):
+    if clear_cache:
+        _clear_spsv_csr_preprocess_cache()
+    if return_time:
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+    (
+        _data,
+        _b,
+        _original_output_dtype,
+        trans_mode,
+        _n_rows,
+        _n_cols,
+        solve_plan,
+    ) = _resolve_spsv_csr_runtime(
+        data,
+        indices,
+        indptr,
+        b,
+        shape,
+        lower,
+        transpose,
+        unit_diagonal,
+        requested_solve_kind=solve_kind,
+    )
+    _select_spsv_runtime_plan(
+        solve_plan, trans_mode, requested_solve_kind=solve_kind
+    )
+    if return_time:
+        torch.cuda.synchronize()
+        return (time.perf_counter() - t0) * 1000.0
+
+
 def flagsparse_spsv_analysis_coo(
     data,
     row,
@@ -3708,7 +3752,12 @@ def _execute_spsv_csr_plan(
     if solve_kind == "csr_nnz_balance":
         if tmp_sum_buf is None or ready_buf is None or indegree_buf is None:
             raise RuntimeError("csr_nnz_balance workspace is missing required buffers")
+        tmp_sum_buf.zero_()
+        ready_buf.zero_()
+        indegree_buf.copy_(nnz_balance_indegree32)
     if solve_kind == "transpose_cw":
+        if residual_buf is None or indegree_buf is None or row_counter_buf is None:
+            raise RuntimeError("transpose_cw workspace is missing required buffers")
         transpose_sig = _transpose_cw_preprocess_signature(
             solve_plan,
             n_rows,
@@ -3716,12 +3765,12 @@ def _execute_spsv_csr_plan(
             block_nnz_use,
             max_segments_use,
         )
-        if isinstance(workspace, FlagSparseSpSVWorkspace):
-            transpose_preprocessed = (
-                workspace.prepared_solve_kind == "transpose_cw"
-                and workspace.prepared_signature == transpose_sig
-            )
-        if not transpose_preprocessed:
+        preprocess_stream_ctx = (
+            torch.cuda.stream(solve_stream)
+            if solve_stream is not None
+            else nullcontext()
+        )
+        with preprocess_stream_ctx:
             _run_spsv_csc_preprocess(
                 kernel_indices,
                 kernel_indptr,
@@ -3732,10 +3781,10 @@ def _execute_spsv_csr_plan(
                 block_nnz_use=block_nnz_use,
                 max_segments_use=max_segments_use,
             )
-            transpose_preprocessed = True
-            if isinstance(workspace, FlagSparseSpSVWorkspace):
-                workspace.prepared_solve_kind = "transpose_cw"
-                workspace.prepared_signature = transpose_sig
+        transpose_preprocessed = True
+        if isinstance(workspace, FlagSparseSpSVWorkspace):
+            workspace.prepared_solve_kind = "transpose_cw"
+            workspace.prepared_signature = transpose_sig
     stream_ctx = (
         torch.cuda.stream(solve_stream)
         if solve_stream is not None
