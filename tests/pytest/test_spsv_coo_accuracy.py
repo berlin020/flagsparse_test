@@ -131,6 +131,74 @@ def test_spsv_coo_upper_trans_supported_combos(n, dtype, index_dtype):
 
 @pytest.mark.spsv
 @pytest.mark.parametrize("n", SPSV_N)
+@pytest.mark.parametrize("dtype", TRANS_CONJ_DTYPES, ids=_dtype_id)
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+def test_spsv_coo_conj_supported_combos(n, dtype, index_dtype):
+    device = torch.device("cuda")
+    A = _build_triangular(n, dtype, device, lower=True)
+    b = _rand_like(dtype, (n,), device)
+    A_ref = A.to(dtype)
+    b_ref = b.to(dtype)
+    x_ref = torch.linalg.solve_triangular(
+        _apply_ref_op(A_ref, "CONJ"),
+        b_ref.unsqueeze(-1),
+        upper=_effective_upper(True, "CONJ"),
+    ).squeeze(-1)
+
+    A_coo = A.to_sparse_coo().coalesce()
+    row, col = A_coo.indices()
+    data = A_coo.values()
+
+    x = flagsparse_spsv_coo(
+        data,
+        row.to(index_dtype),
+        col.to(index_dtype),
+        b,
+        (n, n),
+        lower=True,
+        unit_diagonal=False,
+        transpose=_transpose_arg("CONJ"),
+    )
+    rtol, atol = _tol(dtype)
+    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.spsv
+@pytest.mark.parametrize("n", SPSV_N)
+@pytest.mark.parametrize("dtype", TRANS_CONJ_DTYPES, ids=_dtype_id)
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+def test_spsv_coo_upper_conj_supported_combos(n, dtype, index_dtype):
+    device = torch.device("cuda")
+    A = _build_triangular(n, dtype, device, lower=False)
+    b = _rand_like(dtype, (n,), device)
+    A_ref = A.to(dtype)
+    b_ref = b.to(dtype)
+    x_ref = torch.linalg.solve_triangular(
+        _apply_ref_op(A_ref, "CONJ"),
+        b_ref.unsqueeze(-1),
+        upper=_effective_upper(False, "CONJ"),
+    ).squeeze(-1)
+
+    A_coo = A.to_sparse_coo().coalesce()
+    row, col = A_coo.indices()
+    data = A_coo.values()
+
+    x = flagsparse_spsv_coo(
+        data,
+        row.to(index_dtype),
+        col.to(index_dtype),
+        b,
+        (n, n),
+        lower=False,
+        unit_diagonal=False,
+        transpose=_transpose_arg("CONJ"),
+    )
+    rtol, atol = _tol(dtype)
+    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.spsv
+@pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", NON_TRANS_DTYPES, ids=_dtype_id)
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
 def test_spsv_coo_non_trans_supported_combos(n, dtype, index_dtype):
