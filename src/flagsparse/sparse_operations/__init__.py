@@ -9,7 +9,7 @@ from .alpha_spmm_alg1 import (
     is_alpha_spmm_alg1_tle_available,
     prepare_alpha_spmm_alg1,
     prepare_alpha_spmm_alg1_tle,
-from ._common import SUPPORTED_INDEX_DTYPES, SUPPORTED_VALUE_DTYPES
+)
 from .benchmarks import (
     benchmark_gather_case,
     benchmark_performance,
@@ -68,20 +68,6 @@ from .spmv_csr import (
     prepare_spmv_csr,
 )
 from .spsm import benchmark_spsm_case, flagsparse_spsm_coo, flagsparse_spsm_csr
-from .spsv import flagsparse_spsv_coo, flagsparse_spsv_csr
-
-_BENCHMARK_EXPORTS = {
-    "benchmark_gather_case",
-    "benchmark_performance",
-    "benchmark_scatter_case",
-    "benchmark_spmv_case",
-    "comprehensive_gather_test",
-    "comprehensive_scatter_test",
-    "comprehensive_spsm_test",
-}
-from .spmm_coo import flagsparse_spmm_coo
-from .spgemm_csr import SpGEMMPrepared, flagsparse_spgemm_csr, prepare_spgemm_csr
-from .sddmm_csr import SDDMMPrepared, flagsparse_sddmm_csr, prepare_sddmm_csr
 from .spsv import (
     FlagSparseDnVecDescr,
     FlagSparseSpMatDescr,
@@ -106,7 +92,6 @@ from .spsv import (
     flagsparse_spsv_solve_coo,
     flagsparse_spsv_solve_csr,
 )
-from .spsm import flagsparse_spsm_coo, flagsparse_spsm_csr
 
 __all__ = [
     "PreparedCoo",
@@ -188,14 +173,6 @@ __all__ = [
     "triton_cusparse_gather",
     "triton_cusparse_scatter",
 ]
-
-
-def __getattr__(name):
-    if name in _BENCHMARK_EXPORTS:
-        from . import benchmarks as _benchmarks
-
-        return getattr(_benchmarks, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def __dir__():
