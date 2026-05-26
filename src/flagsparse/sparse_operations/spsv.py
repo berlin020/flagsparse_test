@@ -1,5 +1,8 @@
 """Sparse triangular solve (SpSV) CSR/COO."""
 
+import ctypes
+
+from . import _common as _common_mod
 from ._common import *
 
 from collections import OrderedDict
@@ -9,6 +12,18 @@ import os
 import time
 import triton
 import triton.language as tl
+
+hip = _common_mod.hip
+hipsparse = _common_mod.hipsparse
+HipPointer = _common_mod.HipPointer
+_benchmark_prepared_cuda_op = _common_mod._benchmark_prepared_cuda_op
+_hip_check_result = _common_mod._hip_check_result
+_hipsparse_lookup = _common_mod._hipsparse_lookup
+_hipsparse_unavailable_reason = _common_mod._hipsparse_unavailable_reason
+_hipsparse_value_type = _common_mod._hipsparse_value_type
+_hipsparse_scalar = _common_mod._hipsparse_scalar
+_hipsparse_index_type = _common_mod._hipsparse_index_type
+_hipsparse_spmv_operation = _common_mod._hipsparse_spmv_operation
 
 SUPPORTED_SPSV_VALUE_DTYPES = (
     torch.float32,
@@ -50,6 +65,79 @@ SPSV_PROMOTE_TRANSPOSE_COMPLEX64_TO_COMPLEX128 = _spsv_env_flag(
 )
 _SPSV_CSR_PREPROCESS_CACHE = OrderedDict()
 _SPSV_CSR_PREPROCESS_CACHE_SIZE = 8
+
+
+def _hipsparse_spsv_op(op):
+    return _hipsparse_spmv_operation(op, "hipSPARSE CSR SpSV")
+
+
+def _hipsparse_spmat_attribute(name):
+    mapping = {
+        "fill_mode": ("HIPSPARSE_SPMAT_FILL_MODE",),
+        "diag_type": ("HIPSPARSE_SPMAT_DIAG_TYPE",),
+    }
+    if name not in mapping:
+        raise RuntimeError(f"Unsupported hipSPARSE SpMat attribute: {name}")
+    return _hipsparse_lookup("hipsparseSpMatAttribute_t", mapping[name])
+
+
+def _hipsparse_fill_mode_enum(lower):
+    return _hipsparse_lookup(
+        "hipsparseFillMode_t",
+        ("HIPSPARSE_FILL_MODE_LOWER",)
+        if lower
+        else ("HIPSPARSE_FILL_MODE_UPPER",),
+    )
+
+
+def _hipsparse_diag_type_enum(unit_diagonal):
+    return _hipsparse_lookup(
+        "hipsparseDiagType_t",
+        ("HIPSPARSE_DIAG_TYPE_UNIT",)
+        if unit_diagonal
+        else ("HIPSPARSE_DIAG_TYPE_NON_UNIT",),
+    )
+
+
+def _hipsparse_call(attr_names, context):
+    for attr_name in attr_names:
+        fn = getattr(hipsparse, attr_name, None) if hipsparse is not None else None
+        if fn is not None:
+            return fn
+    names = ", ".join(attr_names)
+    raise RuntimeError(f"{context} is unavailable: missing {names}")
+
+
+def _hipsparse_enum_storage(enum_value):
+    try:
+        raw_value = int(enum_value)
+    except Exception:
+        raw_value = getattr(enum_value, "value", enum_value)
+    return ctypes.c_int(int(raw_value))
+
+
+def _hipsparse_set_spmat_attribute(spmat, attr_name, enum_value):
+    setter = _hipsparse_call(
+        ("hipsparseSpMatSetAttribute",),
+        "hipsparseSpMatSetAttribute",
+    )
+    attr = _hipsparse_spmat_attribute(attr_name)
+    payload = _hipsparse_enum_storage(enum_value)
+    attempts = (
+        (spmat, attr, payload, ctypes.sizeof(payload)),
+        (spmat, attr, ctypes.byref(payload), ctypes.sizeof(payload)),
+        (spmat, attr, enum_value, ctypes.sizeof(payload)),
+    )
+    last_error = None
+    for args in attempts:
+        try:
+            _hip_check_result(setter(*args), "hipsparseSpMatSetAttribute")
+            return
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(
+        f"hipsparseSpMatSetAttribute({attr_name}) failed: {last_error}"
+    ) from last_error
 
 @dataclass
 class FlagSparseSpSVDescr:
@@ -737,6 +825,46 @@ def _maybe_sort_csr_rows(data, indices64, indptr64, n_rows, n_cols, lower=True):
     if _csr_rows_are_sorted(indices64, indptr64, n_rows, lower=lower):
         return data, indices64, indptr64
     return _sort_csr_rows(data, indices64, indptr64, n_rows, n_cols, lower=lower)
+
+
+def _validate_spsv_triangular_structure_csr(
+    indices64,
+    indptr64,
+    n_rows,
+    *,
+    lower,
+    unit_diagonal,
+    context,
+):
+    if int(n_rows) <= 0 or int(indices64.numel()) == 0:
+        if not unit_diagonal and int(n_rows) > 0:
+            raise ValueError(f"{context} requires an explicit diagonal entry in every row")
+        return
+
+    row_ids = torch.repeat_interleave(
+        torch.arange(n_rows, device=indices64.device, dtype=torch.int64),
+        indptr64[1:] - indptr64[:-1],
+    )
+    if lower:
+        invalid_mask = indices64 > row_ids
+        shape_name = "lower"
+    else:
+        invalid_mask = indices64 < row_ids
+        shape_name = "upper"
+    if bool(torch.any(invalid_mask).item()):
+        raise ValueError(
+            f"{context} requires a structurally {shape_name}-triangular matrix "
+            "that matches the declared fill mode"
+        )
+
+    if unit_diagonal:
+        return
+
+    diag_mask = indices64 == row_ids
+    if not bool(torch.all(torch.bincount(row_ids[diag_mask], minlength=n_rows) > 0).item()):
+        raise ValueError(
+            f"{context} requires an explicit diagonal entry in every row for non-unit diagonal solves"
+        )
 
 
 def _cw_rhs_bucket(n_rhs):
@@ -1603,6 +1731,14 @@ def _prepare_spsv_csr_system(
     storage_view = _normalize_spsv_storage_view(storage_view)
     if storage_view != "csr_as_csc":
         raise ValueError("TRANS/CONJ SpSV only supports storage_view='csr_as_csc'")
+    _validate_spsv_triangular_structure_csr(
+        indices64,
+        indptr64,
+        n_rows,
+        lower=lower,
+        unit_diagonal=unit_diagonal,
+        context="TRANS/CONJ SpSV",
+    )
     matrix_stats = _build_spsv_cw_matrix_stats(indptr64, n_rows)
     default_block_nnz, default_max_segments = _choose_transpose_family_launch_config(
         indptr64
