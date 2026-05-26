@@ -5,7 +5,9 @@ import csv
 import glob
 import hashlib
 import os
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -942,6 +944,109 @@ def _benchmark_sparse_ref_spsv(
         return None, None
 
 
+def _run_spsv_sparse_ref_worker_subprocess(
+    fmt,
+    mtx_path,
+    value_dtype,
+    index_dtype,
+    op_mode,
+    *,
+    lower,
+    warmup,
+    iters,
+    timeout_seconds=45,
+):
+    py = sys.executable
+    if not py:
+        return None, None
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pt")
+    tmp_path = tmp.name
+    tmp.close()
+    cmd = [
+        py,
+        str(Path(__file__).resolve()),
+        "--_spsv-ref-worker",
+        str(fmt).lower(),
+        "--_worker-mtx",
+        str(mtx_path),
+        "--_worker-output",
+        tmp_path,
+        "--_worker-value-dtype",
+        _dtype_name(value_dtype),
+        "--_worker-index-dtype",
+        _dtype_name(index_dtype),
+        "--_worker-op",
+        str(op_mode).upper(),
+        "--warmup",
+        str(int(warmup)),
+        "--iters",
+        str(int(iters)),
+    ]
+    if not lower:
+        cmd.append("--upper")
+    payload = None
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, timeout=float(timeout_seconds))
+        if os.path.exists(tmp_path):
+            payload = torch.load(tmp_path, map_location="cpu")
+    except subprocess.TimeoutExpired:
+        payload = {
+            "success": False,
+            "reason": f"hipSPARSE SpSV reference worker timed out after {timeout_seconds}s",
+        }
+    except Exception as exc:
+        payload = {
+            "success": False,
+            "reason": str(exc),
+        }
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    if not isinstance(payload, dict) or not payload.get("success"):
+        return None, None
+    values = payload.get("values")
+    if values is not None:
+        values = values.to(dtype=value_dtype)
+    return payload.get("ms"), values
+
+
+def _benchmark_sparse_ref_spsv_for_csv(
+    path,
+    fmt,
+    sparse_ref_data,
+    sparse_ref_indices,
+    sparse_ref_indptr,
+    shape,
+    b,
+    *,
+    lower,
+    op_mode,
+    value_dtype,
+    index_dtype,
+):
+    if fs_spsv_impl._is_rocm_runtime():
+        return _run_spsv_sparse_ref_worker_subprocess(
+            fmt,
+            path,
+            value_dtype,
+            index_dtype,
+            op_mode,
+            lower=lower,
+            warmup=WARMUP,
+            iters=ITERS,
+        )
+    return _benchmark_sparse_ref_spsv(
+        fmt,
+        sparse_ref_data,
+        sparse_ref_indices,
+        sparse_ref_indptr,
+        shape,
+        b,
+        lower=lower,
+        op_mode=op_mode,
+    )
+
+
 def run_spsv_synthetic_all(lower=True, alg_num=None):
     if not torch.cuda.is_available():
         print("CUDA is not available. Please run on a GPU-enabled system.")
@@ -1243,7 +1348,8 @@ def _finalize_csv_row(
     err_hs = None
     ok_hs = False
     x_hs_t = None
-    hipsparse_ms, x_hs_t = _benchmark_sparse_ref_spsv(
+    hipsparse_ms, x_hs_t = _benchmark_sparse_ref_spsv_for_csv(
+        path,
         fmt,
         sparse_ref_data,
         sparse_ref_indices,
@@ -1252,6 +1358,8 @@ def _finalize_csv_row(
         b,
         lower=lower,
         op_mode=op_mode,
+        value_dtype=value_dtype,
+        index_dtype=index_dtype,
     )
     if x_hs_t is not None:
         x_cmp = x
@@ -1899,6 +2007,90 @@ def run_csr_transpose_check(
     print(f"Total cases: {total}  Failed: {failed}")
 
 
+def _run_spsv_reference_worker(args):
+    if not torch.cuda.is_available():
+        payload = {
+            "success": False,
+            "reason": "CUDA is not available in worker",
+        }
+        torch.save(payload, args._worker_output)
+        return 1
+    value_dtype = VALUE_DTYPE_NAME_MAP[str(args._worker_value_dtype).lower()]
+    index_dtype = INDEX_DTYPE_NAME_MAP[str(args._worker_index_dtype).lower()]
+    op_mode = str(args._worker_op).upper()
+    lower = not bool(args.upper)
+    device = torch.device("cuda")
+    data, indices, indptr, shape = _load_mtx_to_csr_torch(
+        args._worker_mtx,
+        dtype=value_dtype,
+        device=device,
+        lower=lower,
+    )
+    indices = indices.to(index_dtype)
+    indptr = indptr.to(index_dtype)
+    seed_prefix = "csv-csr" if str(args._spsv_ref_worker).upper() == "CSR" else "csv-coo"
+    b = _random_rhs_for_spsv(
+        shape,
+        value_dtype,
+        device,
+        op_mode=op_mode,
+        seed=_stable_case_seed(
+            seed_prefix,
+            os.path.basename(args._worker_mtx),
+            "LOWER" if lower else "UPPER",
+            op_mode,
+            _dtype_name(value_dtype),
+            _dtype_name(index_dtype),
+        ),
+    )
+    try:
+        if str(args._spsv_ref_worker).upper() == "COO":
+            data_in, row_in, col_in = _coo_inputs_for_csv(
+                data, indices, indptr, shape, index_dtype=index_dtype
+            )
+            result = fs_spsv_impl._benchmark_spsv_coo_sparse_ref(
+                data_in,
+                row_in,
+                col_in,
+                b,
+                shape,
+                lower=lower,
+                unit_diagonal=False,
+                op=str(op_mode).lower(),
+                warmup=max(0, int(args.warmup)),
+                iters=max(1, int(args.iters)),
+            )
+        else:
+            result = fs_spsv_impl._benchmark_spsv_csr_sparse_ref(
+                data,
+                indices,
+                indptr,
+                b,
+                shape,
+                lower=lower,
+                unit_diagonal=False,
+                op=str(op_mode).lower(),
+                warmup=max(0, int(args.warmup)),
+                iters=max(1, int(args.iters)),
+            )
+        values = result.get("values")
+        payload = {
+            "success": values is not None,
+            "reason": result.get("reason"),
+            "ms": result.get("ms"),
+            "values": None if values is None else values.detach().to("cpu"),
+        }
+    except Exception as exc:
+        payload = {
+            "success": False,
+            "reason": str(exc),
+            "ms": None,
+            "values": None,
+        }
+    torch.save(payload, args._worker_output)
+    return 0 if payload.get("success") else 1
+
+
 def main():
     global WARMUP, ITERS, PYTORCH_REF_MODE
     parser = argparse.ArgumentParser(
@@ -1987,10 +2179,25 @@ def main():
         default=ITERS,
         help="Benchmark timed iterations (Library-main style default: 1)",
     )
+    parser.add_argument("--_spsv-ref-worker", type=str, choices=["csr", "coo"], default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--_worker-mtx", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--_worker-output", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--_worker-value-dtype", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--_worker-index-dtype", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--_worker-op", type=str, default="NON", help=argparse.SUPPRESS)
     args = parser.parse_args()
     WARMUP = max(0, int(args.warmup))
     ITERS = max(1, int(args.iters))
     PYTORCH_REF_MODE = args.pytorch_ref
+    if args._spsv_ref_worker is not None:
+        if (
+            not args._worker_mtx
+            or not args._worker_output
+            or not args._worker_value_dtype
+            or not args._worker_index_dtype
+        ):
+            raise SystemExit("worker mode requires matrix, output, value dtype, and index dtype")
+        raise SystemExit(_run_spsv_reference_worker(args))
     lower = not args.upper
     if args.alg_num in (2, 3, 4, 8):
         if args.check_transpose:
