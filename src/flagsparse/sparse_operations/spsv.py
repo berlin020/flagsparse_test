@@ -287,6 +287,20 @@ def _spsv_csr_sparse_ref_backend(value_dtype, index_dtype, indptr_dtype=None, op
     return None, "direct hipSPARSE CSR SpSV reference requires a ROCm runtime"
 
 
+def _spsv_coo_sparse_ref_backend(value_dtype, index_dtype, op="non"):
+    if _is_rocm_runtime():
+        reason = _hipsparse_spsv_skip_reason(
+            value_dtype,
+            index_dtype,
+            index_dtype,
+            op=op,
+        )
+        if reason is None:
+            return "hipsparse", None
+        return None, reason
+    return None, "direct hipSPARSE COO SpSV reference requires a ROCm runtime"
+
+
 @dataclass
 class FlagSparseSpSVDescr:
     """Host-side analysis handle for Triton SpSV.
@@ -895,6 +909,157 @@ def _benchmark_spsv_csr_sparse_ref(
                 data,
                 indices,
                 indptr,
+                rhs,
+                shape,
+                lower=lower,
+                unit_diagonal=unit_diagonal,
+                op=op,
+            ),
+            _run_spsv_csr_ref_hipsparse_prepared,
+            _destroy_spsv_csr_ref_hipsparse_prepared,
+            warmup=warmup,
+            iters=iters,
+        )
+        result["values"] = values
+        result["ms"] = ms
+        result["reason"] = None
+    except Exception as exc:
+        result["values"] = None
+        result["ms"] = None
+        result["reason"] = str(exc)
+    return result
+
+
+def _prepare_spsv_coo_ref_hipsparse(
+    data,
+    row,
+    col,
+    rhs,
+    shape,
+    *,
+    lower=True,
+    unit_diagonal=False,
+    op="non",
+    out=None,
+):
+    op_name = _normalize_sparse_reference_op(op)
+    skip_reason = _hipsparse_spsv_skip_reason(
+        data.dtype,
+        row.dtype,
+        col.dtype,
+        op=op_name,
+    )
+    if skip_reason is not None:
+        raise RuntimeError(skip_reason)
+    data, _input_index_dtype, row64, col64, rhs, n_rows, n_cols = _prepare_spsv_coo_inputs(
+        data,
+        row,
+        col,
+        rhs,
+        shape,
+    )
+    if op_name == "non":
+        _validate_spsv_non_trans_combo(data.dtype, row.dtype, "COO")
+    else:
+        _validate_spsv_trans_combo(data.dtype, row.dtype, "COO")
+    data_csr, indices_csr, indptr_csr = _coo2csr_for_spsv(
+        data,
+        row64,
+        col64,
+        n_rows,
+        assume_ordered=False,
+    )
+    state = _prepare_spsv_csr_ref_hipsparse(
+        data_csr,
+        indices_csr,
+        indptr_csr,
+        rhs,
+        (n_rows, n_cols),
+        lower=lower,
+        unit_diagonal=unit_diagonal,
+        op=op_name,
+        out=out,
+    )
+    # Keep canonicalized CSR tensors alive for the prepared hipSPARSE descriptors.
+    state["canonical_data"] = data_csr
+    state["canonical_indices"] = indices_csr
+    state["canonical_indptr"] = indptr_csr
+    state["input_format"] = "coo"
+    state["canonical_format"] = "csr"
+    return state
+
+
+def _spsv_coo_ref_hipsparse(
+    data,
+    row,
+    col,
+    rhs,
+    shape,
+    *,
+    lower=True,
+    unit_diagonal=False,
+    op="non",
+    out=None,
+    return_metadata=False,
+):
+    state = _prepare_spsv_coo_ref_hipsparse(
+        data,
+        row,
+        col,
+        rhs,
+        shape,
+        lower=lower,
+        unit_diagonal=unit_diagonal,
+        op=op,
+        out=out,
+    )
+    try:
+        solution = _run_spsv_csr_ref_hipsparse_prepared(state)
+        metadata = {
+            "backend": "hipsparse",
+            "buffer_size": int(state.get("buffer_size", 0)),
+            "format": "coo",
+            "canonical_format": "csr",
+        }
+        if return_metadata:
+            return solution, metadata
+        return solution
+    finally:
+        _destroy_spsv_csr_ref_hipsparse_prepared(state)
+
+
+def _benchmark_spsv_coo_sparse_ref(
+    data,
+    row,
+    col,
+    rhs,
+    shape,
+    *,
+    lower=True,
+    unit_diagonal=False,
+    op="non",
+    warmup=0,
+    iters=1,
+):
+    backend, reason = _spsv_coo_sparse_ref_backend(
+        data.dtype,
+        row.dtype,
+        op=op,
+    )
+    result = {
+        "backend": backend,
+        "values": None,
+        "ms": None,
+        "reason": reason,
+    }
+    if backend is None:
+        return result
+    try:
+        values, ms = _benchmark_prepared_cuda_op(
+            lambda: _prepare_spsv_coo_ref_hipsparse(
+                data,
+                row,
+                col,
                 rhs,
                 shape,
                 lower=lower,
