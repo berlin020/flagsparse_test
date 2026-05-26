@@ -33,6 +33,7 @@ INDEX_DTYPES = [torch.int32, torch.int64]
 TEST_SIZES = [256, 512, 1024, 2048]
 WARMUP = 1
 ITERS = 1
+PYTORCH_REF_MODE = os.environ.get("FLAGSPARSE_PYTORCH_REF", "auto").strip().lower() or "auto"
 
 SPSV_TRIANGULAR_DIAG_DOMINANCE = 4.0
 # CSR 完整组合覆盖（在原 csv-csr 逻辑外新增，不影响原入口）
@@ -107,6 +108,13 @@ def _parse_alg_num(raw):
     return value
 
 
+def _parse_pytorch_ref_mode(raw):
+    token = str(raw).strip().lower()
+    if token not in ("auto", "on", "off"):
+        raise ValueError("pytorch_ref_mode must be one of: auto, on, off")
+    return token
+
+
 def _solve_kind_for_case(alg_num, op_mode):
     if op_mode in ("TRANS", "CONJ"):
         return "transpose_cw"
@@ -123,6 +131,40 @@ def _alg_note_for_op(alg_num, op_mode):
     if alg_num is not None and op_mode in ("TRANS", "CONJ"):
         return "Explicit alg_num applies to NON only; TRANS/CONJ use transpose_cw."
     return None
+
+
+def _pytorch_ref_policy_note(op_mode):
+    if (
+        PYTORCH_REF_MODE == "auto"
+        and fs_spsv_impl._is_rocm_runtime()
+        and op_mode in ("TRANS", "CONJ")
+    ):
+        return (
+            "PyTorch sparse.spsolve is auto-skipped for TRANS/CONJ on ROCm "
+            "to keep the benchmark path stable; use --pytorch-ref on to force it."
+        )
+    if PYTORCH_REF_MODE == "off":
+        return "PyTorch sparse.spsolve reference is disabled by CLI/environment."
+    return None
+
+
+def _prefer_hipsparse_reference():
+    return fs_spsv_impl._is_rocm_runtime()
+
+
+def _reference_pass_status(ok_pt, has_pt, ok_hs, has_hs):
+    if _prefer_hipsparse_reference():
+        if has_hs:
+            return ok_hs
+        return ok_pt if has_pt else False
+    return (ok_pt and has_pt) or (ok_hs and has_hs)
+
+
+def _reference_error_summary(err_pt, err_hs):
+    if _prefer_hipsparse_reference() and err_hs is not None:
+        return err_hs
+    ref_errors = [err for err in (err_pt, err_hs) if err is not None]
+    return min(ref_errors) if ref_errors else None
 
 
 def _fmt_ms(v):
@@ -264,7 +306,25 @@ def _build_csr_tensor_for_op(data, indices, indptr, shape, op_mode):
     )
 
 
+def _should_run_pytorch_reference(op_mode):
+    if PYTORCH_REF_MODE == "off":
+        return False, "PyTorch sparse solve disabled by CLI/environment"
+    if (
+        PYTORCH_REF_MODE == "auto"
+        and fs_spsv_impl._is_rocm_runtime()
+        and op_mode in ("TRANS", "CONJ")
+    ):
+        return (
+            False,
+            "PyTorch sparse solve auto-skipped for TRANS/CONJ on ROCm stability path",
+        )
+    return True, None
+
+
 def _benchmark_pytorch_reference(data, indices, indptr, shape, b, *, lower, op_mode):
+    should_run, skip_reason = _should_run_pytorch_reference(op_mode)
+    if not should_run:
+        return None, None, "disabled", skip_reason
     try:
         sparse_spsolve = getattr(torch.sparse, "spsolve", None)
         if sparse_spsolve is None:
@@ -1037,11 +1097,16 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
                             else False
                         )
                         ok_hs = (
-                            True
-                            if x_hs_t is None
-                            else torch.allclose(x, x_hs_t, atol=atol, rtol=rtol)
+                            torch.allclose(x, x_hs_t, atol=atol, rtol=rtol)
+                            if x_hs_t is not None
+                            else False
                         )
-                        ok = ok_pt or ok_hs
+                        ok = _reference_pass_status(
+                            ok_pt,
+                            x_pt is not None,
+                            ok_hs,
+                            x_hs_t is not None,
+                        )
                         status = "PASS" if ok else "FAIL"
                         if not ok:
                             failed += 1
@@ -1198,11 +1263,15 @@ def _finalize_csv_row(
         )
         ok_hs = torch.allclose(x_cmp, x_hs_cmp, atol=atol, rtol=rtol)
 
-    status = "PASS" if (ok_pt or ok_hs) else "FAIL"
+    status = "PASS" if _reference_pass_status(
+        ok_pt,
+        x_ref is not None,
+        ok_hs,
+        x_hs_t is not None,
+    ) else "FAIL"
     if (not ok_pt) and (not ok_hs) and (err_pt is None and err_hs is None):
         status = "REF_FAIL"
-    ref_errors = [err for err in (err_pt, err_hs) if err is not None]
-    err_ref = min(ref_errors) if ref_errors else None
+    err_ref = _reference_error_summary(err_pt, err_hs)
 
     row = {
         "matrix": os.path.basename(path),
@@ -1320,9 +1389,16 @@ def run_all_supported_spsv_csr_csv(
                 alg_note = _alg_note_for_op(alg_num, op_mode)
                 if alg_note is not None:
                     print(f"Route note: {alg_note}")
+                pt_note = _pytorch_ref_policy_note(op_mode)
+                if pt_note is not None:
+                    print(f"Reference note: {pt_note}")
                 print(
-                    "Formats: FlagSparse=CSR, hipSPARSE=CSR ref, "
-                    "PyTorch(ms)=official sparse solve reference"
+                    "Formats: FlagSparse=CSR, hipSPARSE=CSR ref"
+                    + (
+                        ", PyTorch(ms)=secondary diagnostic reference"
+                        if _prefer_hipsparse_reference()
+                        else ", PyTorch(ms)=official sparse solve reference"
+                    )
                 )
                 print(
                     f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
@@ -1488,10 +1564,20 @@ def run_all_dtypes_spsv_coo_csv(
                 alg_note = _alg_note_for_op(alg_num, op_mode)
                 if alg_note is not None:
                     print(f"Route note: {alg_note}")
+                pt_note = _pytorch_ref_policy_note(op_mode)
+                if pt_note is not None:
+                    print(f"Reference note: {pt_note}")
                 print(
-                    "Formats: FlagSparse=COO input routed through CSR SpSV, hipSPARSE=COO input canonicalized through CSR ref, "
-                    "PyTorch(ms)=official sparse solve reference. "
-                    "RHS is generated directly."
+                    (
+                        "Formats: FlagSparse=COO input routed through CSR SpSV, "
+                        "hipSPARSE=COO input canonicalized through CSR ref, "
+                        + (
+                            "PyTorch(ms)=secondary diagnostic reference. "
+                            if _prefer_hipsparse_reference()
+                            else "PyTorch(ms)=official sparse solve reference. "
+                        )
+                        + "RHS is generated directly."
+                    )
                 )
                 print(
                     f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
@@ -1814,7 +1900,7 @@ def run_csr_transpose_check(
 
 
 def main():
-    global WARMUP, ITERS
+    global WARMUP, ITERS, PYTORCH_REF_MODE
     parser = argparse.ArgumentParser(
         description="SpSV test: synthetic triangular systems and optional .mtx (CSR/COO), same baselines as CSR."
     )
@@ -1881,6 +1967,15 @@ def main():
         help="Comma-separated index dtype filter for CSR CSV, e.g. int32,int64",
     )
     parser.add_argument(
+        "--pytorch-ref",
+        type=_parse_pytorch_ref_mode,
+        default=PYTORCH_REF_MODE,
+        help=(
+            "PyTorch sparse reference mode: auto keeps NON on and auto-skips "
+            "TRANS/CONJ on ROCm for stability; on forces it; off disables it."
+        ),
+    )
+    parser.add_argument(
         "--warmup",
         type=int,
         default=WARMUP,
@@ -1895,6 +1990,7 @@ def main():
     args = parser.parse_args()
     WARMUP = max(0, int(args.warmup))
     ITERS = max(1, int(args.iters))
+    PYTORCH_REF_MODE = args.pytorch_ref
     lower = not args.upper
     if args.alg_num in (2, 3, 4, 8):
         if args.check_transpose:

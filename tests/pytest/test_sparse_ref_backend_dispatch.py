@@ -121,7 +121,7 @@ def test_spsv_coo_sparse_ref_backend_reports_reason_when_unsupported(monkeypatch
     monkeypatch.setattr(
         spsv_mod,
         "_hipsparse_spsv_skip_reason",
-        lambda *args, **kwargs: "direct hipSPARSE COO SpSV unsupported",
+        lambda *args, **kwargs: "hipSPARSE COO-input SpSV reference unsupported",
     )
     backend, reason = spsv_mod._spsv_coo_sparse_ref_backend(
         torch.complex64,
@@ -129,7 +129,7 @@ def test_spsv_coo_sparse_ref_backend_reports_reason_when_unsupported(monkeypatch
         op="trans",
     )
     assert backend is None
-    assert reason == "direct hipSPARSE COO SpSV unsupported"
+    assert reason == "hipSPARSE COO-input SpSV reference unsupported"
 
 
 def test_spsm_csr_sparse_ref_backend_selects_hipsparse_when_direct_supported(monkeypatch):

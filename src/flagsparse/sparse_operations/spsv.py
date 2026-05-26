@@ -298,7 +298,7 @@ def _spsv_coo_sparse_ref_backend(value_dtype, index_dtype, op="non"):
         if reason is None:
             return "hipsparse", None
         return None, reason
-    return None, "direct hipSPARSE COO SpSV reference requires a ROCm runtime"
+    return None, "hipSPARSE COO-input SpSV reference (canonicalized through CSR) requires a ROCm runtime"
 
 
 @dataclass
