@@ -124,11 +124,7 @@ def _alg_num_supports_case(alg_num, fmt, op_mode, lower, value_dtype):
     if alg_num == 1:
         return True
     if alg_num in (2, 3, 4, 8):
-        return (
-            fmt in ("CSR", "COO")
-            and op_mode == "NON"
-            and bool(lower)
-        )
+        return fmt in ("CSR", "COO") and op_mode == "NON"
     return False
 
 
@@ -1987,10 +1983,6 @@ def main():
         if args.check_transpose:
             raise ValueError(
                 f"ALG{args.alg_num} matches allinone's NON-only path; --check-transpose is not supported"
-            )
-        if args.upper:
-            raise ValueError(
-                f"ALG{args.alg_num} matches allinone's lower-triangular path; --upper is not supported"
             )
         if args.ops:
             op_modes_cli = _parse_op_modes_filter(args.ops)
