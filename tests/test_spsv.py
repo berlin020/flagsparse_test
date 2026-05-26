@@ -5,9 +5,7 @@ import csv
 import glob
 import hashlib
 import os
-import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -35,7 +33,6 @@ INDEX_DTYPES = [torch.int32, torch.int64]
 TEST_SIZES = [256, 512, 1024, 2048]
 WARMUP = 1
 ITERS = 1
-PYTORCH_REF_MODE = os.environ.get("FLAGSPARSE_PYTORCH_REF", "auto").strip().lower() or "auto"
 
 SPSV_TRIANGULAR_DIAG_DOMINANCE = 4.0
 # CSR 完整组合覆盖（在原 csv-csr 逻辑外新增，不影响原入口）
@@ -110,16 +107,7 @@ def _parse_alg_num(raw):
     return value
 
 
-def _parse_pytorch_ref_mode(raw):
-    token = str(raw).strip().lower()
-    if token not in ("auto", "on", "off"):
-        raise ValueError("pytorch_ref_mode must be one of: auto, on, off")
-    return token
-
-
-def _solve_kind_for_case(alg_num, op_mode):
-    if op_mode in ("TRANS", "CONJ"):
-        return "transpose_cw"
+def _solve_kind_from_alg_num(alg_num):
     if alg_num is None:
         return None
     return SPSV_ALG_NUM_TO_SOLVE_KIND[int(alg_num)]
@@ -129,44 +117,19 @@ def _alg_label(alg_num):
     return "AUTO" if alg_num is None else f"ALG{int(alg_num)}"
 
 
-def _alg_note_for_op(alg_num, op_mode):
-    if alg_num is not None and op_mode in ("TRANS", "CONJ"):
-        return "Explicit alg_num applies to NON only; TRANS/CONJ use transpose_cw."
-    return None
-
-
-def _pytorch_ref_policy_note(op_mode):
-    if (
-        PYTORCH_REF_MODE == "auto"
-        and fs_spsv_impl._is_rocm_runtime()
-        and op_mode in ("TRANS", "CONJ")
-    ):
+def _alg_num_supports_case(alg_num, fmt, op_mode, lower, value_dtype):
+    del lower, value_dtype
+    if alg_num is None:
+        return True
+    alg_num = int(alg_num)
+    if alg_num == 1:
+        return True
+    if alg_num in (2, 3, 4, 8):
         return (
-            "PyTorch sparse.spsolve is auto-skipped for TRANS/CONJ on ROCm "
-            "to keep the benchmark path stable; use --pytorch-ref on to force it."
+            fmt in ("CSR", "COO")
+            and op_mode == "NON"
         )
-    if PYTORCH_REF_MODE == "off":
-        return "PyTorch sparse.spsolve reference is disabled by CLI/environment."
-    return None
-
-
-def _prefer_hipsparse_reference():
-    return fs_spsv_impl._is_rocm_runtime()
-
-
-def _reference_pass_status(ok_pt, has_pt, ok_hs, has_hs):
-    if _prefer_hipsparse_reference():
-        if has_hs:
-            return ok_hs
-        return ok_pt if has_pt else False
-    return (ok_pt and has_pt) or (ok_hs and has_hs)
-
-
-def _reference_error_summary(err_pt, err_hs):
-    if _prefer_hipsparse_reference() and err_hs is not None:
-        return err_hs
-    ref_errors = [err for err in (err_pt, err_hs) if err is not None]
-    return min(ref_errors) if ref_errors else None
+    return False
 
 
 def _fmt_ms(v):
@@ -308,25 +271,7 @@ def _build_csr_tensor_for_op(data, indices, indptr, shape, op_mode):
     )
 
 
-def _should_run_pytorch_reference(op_mode):
-    if PYTORCH_REF_MODE == "off":
-        return False, "PyTorch sparse solve disabled by CLI/environment"
-    if (
-        PYTORCH_REF_MODE == "auto"
-        and fs_spsv_impl._is_rocm_runtime()
-        and op_mode in ("TRANS", "CONJ")
-    ):
-        return (
-            False,
-            "PyTorch sparse solve auto-skipped for TRANS/CONJ on ROCm stability path",
-        )
-    return True, None
-
-
 def _benchmark_pytorch_reference(data, indices, indptr, shape, b, *, lower, op_mode):
-    should_run, skip_reason = _should_run_pytorch_reference(op_mode)
-    if not should_run:
-        return None, None, "disabled", skip_reason
     try:
         sparse_spsolve = getattr(torch.sparse, "spsolve", None)
         if sparse_spsolve is None:
@@ -349,7 +294,11 @@ def _benchmark_pytorch_reference(data, indices, indptr, shape, b, *, lower, op_m
         return None, None, "unavailable", f"PyTorch sparse solve unavailable ({sparse_err})"
 
 
-def _supported_spsv_ops(value_dtype, index_dtype):
+def _sparse_ref_inputs(data, b):
+    return data, b
+
+
+def _supported_csr_full_ops(value_dtype, index_dtype):
     if value_dtype not in CSR_FULL_VALUE_DTYPES:
         return []
     if index_dtype == torch.int32:
@@ -762,49 +711,31 @@ def _benchmark_flagsparse_spsv_coo_split(
     return x, analysis_ms, solve_ms
 
 
-def _benchmark_sparse_ref_spsv(
+def _benchmark_sparse_ref_lower_csr_or_coo(
     fmt,
     data,
     indices,
     indptr,
     shape,
     b,
-    *,
+    warmup,
+    iters,
     lower,
-    op_mode="NON",
-    warmup=WARMUP,
-    iters=ITERS,
 ):
     """Triangular solve via hipSPARSE-on-ROCm or CuPy-on-CUDA."""
-    fmt_name = str(fmt).strip().upper()
-    op_name = str(op_mode).strip().lower()
     if fs_spsv_impl._is_rocm_runtime():
-        if fmt_name == "COO":
-            sparse_ref = fs_spsv_impl._benchmark_spsv_coo_sparse_ref(
-                data,
-                indices,
-                indptr,
-                b,
-                shape,
-                lower=lower,
-                unit_diagonal=False,
-                op=op_name,
-                warmup=warmup,
-                iters=iters,
-            )
-        else:
-            sparse_ref = fs_spsv_impl._benchmark_spsv_csr_sparse_ref(
-                data,
-                indices,
-                indptr,
-                b,
-                shape,
-                lower=lower,
-                unit_diagonal=False,
-                op=op_name,
-                warmup=warmup,
-                iters=iters,
-            )
+        sparse_ref = fs_spsv_impl._benchmark_spsv_csr_sparse_ref(
+            data,
+            indices,
+            indptr,
+            b,
+            shape,
+            lower=lower,
+            unit_diagonal=False,
+            op="non",
+            warmup=warmup,
+            iters=iters,
+        )
         return sparse_ref["ms"], sparse_ref["values"]
     if (
         cp is None
@@ -814,13 +745,14 @@ def _benchmark_sparse_ref_spsv(
         return None, None
     try:
         b_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(b.contiguous()))
-        if fmt_name == "COO":
-            data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data.contiguous()))
+        if fmt == "COO":
+            dc, rr, cc = _csr_to_coo(data, indices, indptr, shape)
+            data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(dc.contiguous()))
             row_cp = cp.from_dlpack(
-                torch.utils.dlpack.to_dlpack(indices.to(torch.int64).contiguous())
+                torch.utils.dlpack.to_dlpack(rr.to(torch.int64).contiguous())
             )
             col_cp = cp.from_dlpack(
-                torch.utils.dlpack.to_dlpack(indptr.to(torch.int64).contiguous())
+                torch.utils.dlpack.to_dlpack(cc.to(torch.int64).contiguous())
             )
             A_cp = cpx_sparse.coo_matrix((data_cp, (row_cp, col_cp)), shape=shape)
         else:
@@ -832,18 +764,9 @@ def _benchmark_sparse_ref_spsv(
                 torch.utils.dlpack.to_dlpack(indptr.contiguous())
             )
             A_cp = cpx_sparse.csr_matrix((data_cp, idx_cp, ptr_cp), shape=shape)
-        if op_name == "trans":
-            A_eff = A_cp.transpose().tocsr()
-            lower_eff = not lower
-        elif op_name == "conj":
-            A_eff = A_cp.transpose().conj().tocsr()
-            lower_eff = not lower
-        else:
-            A_eff = A_cp
-            lower_eff = lower
         for _ in range(warmup):
             _ = cpx_spsolve_triangular(
-                A_eff, b_cp, lower=lower_eff, unit_diagonal=False
+                A_cp, b_cp, lower=lower, unit_diagonal=False
             )
         cp.cuda.runtime.deviceSynchronize()
         t0 = cp.cuda.Event()
@@ -851,7 +774,7 @@ def _benchmark_sparse_ref_spsv(
         t0.record()
         for _ in range(iters):
             x_cu = cpx_spsolve_triangular(
-                A_eff, b_cp, lower=lower_eff, unit_diagonal=False
+                A_cp, b_cp, lower=lower, unit_diagonal=False
             )
         t1.record()
         t1.synchronize()
@@ -863,156 +786,68 @@ def _benchmark_sparse_ref_spsv(
         return None, None
 
 
-def _run_spsv_sparse_ref_worker_subprocess(
-    fmt,
-    mtx_path,
-    value_dtype,
-    index_dtype,
-    op_mode,
-    *,
-    lower,
-    warmup,
-    iters,
-    timeout_seconds=45,
-):
-    py = sys.executable
-    if not py:
-        return None, None
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pt")
-    tmp_path = tmp.name
-    tmp.close()
-    cmd = [
-        py,
-        str(Path(__file__).resolve()),
-        "--_spsv-ref-worker",
-        str(fmt).lower(),
-        "--_worker-mtx",
-        str(mtx_path),
-        "--_worker-output",
-        tmp_path,
-        "--_worker-value-dtype",
-        _dtype_name(value_dtype),
-        "--_worker-index-dtype",
-        _dtype_name(index_dtype),
-        "--_worker-op",
-        str(op_mode).upper(),
-        "--warmup",
-        str(int(warmup)),
-        "--iters",
-        str(int(iters)),
-    ]
-    if not lower:
-        cmd.append("--upper")
-    payload = None
-    try:
-        subprocess.run(cmd, capture_output=True, text=True, timeout=float(timeout_seconds))
-        if os.path.exists(tmp_path):
-            payload = torch.load(tmp_path, map_location="cpu")
-    except subprocess.TimeoutExpired:
-        payload = {
-            "success": False,
-            "reason": f"hipSPARSE SpSV reference worker timed out after {timeout_seconds}s",
-        }
-    except Exception as exc:
-        payload = {
-            "success": False,
-            "reason": str(exc),
-        }
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-    if not isinstance(payload, dict) or not payload.get("success"):
-        return None, None
-    values = payload.get("values")
-    if values is not None:
-        values = values.to(dtype=value_dtype)
-    return payload.get("ms"), values
-
-
-def _benchmark_sparse_ref_spsv_for_csv(
-    path,
-    fmt,
-    sparse_ref_data,
-    sparse_ref_indices,
-    sparse_ref_indptr,
-    csr_data,
-    csr_indices,
-    csr_indptr,
-    shape,
-    b,
-    *,
-    lower,
-    op_mode,
-    value_dtype,
-    index_dtype,
-):
-    fmt_name = str(fmt).strip().upper()
-    op_name = str(op_mode).strip().upper()
-    if fmt_name == "COO":
-        if op_name == "NON":
-            return _benchmark_sparse_ref_spsv(
-                "CSR",
-                csr_data,
-                csr_indices,
-                csr_indptr,
-                shape,
-                b,
-                lower=lower,
-                op_mode=op_mode,
-            )
-        if fs_spsv_impl._is_rocm_runtime():
-            return _run_spsv_sparse_ref_worker_subprocess(
-                "csr",
-                path,
-                value_dtype,
-                index_dtype,
-                op_mode,
-                lower=lower,
-                warmup=WARMUP,
-                iters=ITERS,
-            )
-        return _benchmark_sparse_ref_spsv(
-            "CSR",
-            csr_data,
-            csr_indices,
-            csr_indptr,
-            shape,
-            b,
-            lower=lower,
-            op_mode=op_mode,
-        )
-    if op_name == "NON":
-        return _benchmark_sparse_ref_spsv(
-            fmt,
-            sparse_ref_data,
-            sparse_ref_indices,
-            sparse_ref_indptr,
-            shape,
-            b,
-            lower=lower,
-            op_mode=op_mode,
-        )
+def _benchmark_sparse_ref_csr_with_op(data, indices, indptr, shape, b, op_mode, lower):
     if fs_spsv_impl._is_rocm_runtime():
-        return _run_spsv_sparse_ref_worker_subprocess(
-            fmt,
-            path,
-            value_dtype,
-            index_dtype,
-            op_mode,
+        sparse_ref = fs_spsv_impl._benchmark_spsv_csr_sparse_ref(
+            data,
+            indices,
+            indptr,
+            b,
+            shape,
             lower=lower,
+            unit_diagonal=False,
+            op=op_mode,
             warmup=WARMUP,
             iters=ITERS,
         )
-    return _benchmark_sparse_ref_spsv(
-        fmt,
-        sparse_ref_data,
-        sparse_ref_indices,
-        sparse_ref_indptr,
-        shape,
-        b,
-        lower=lower,
-        op_mode=op_mode,
-    )
+        return sparse_ref["ms"], sparse_ref["values"]
+    if (
+        cp is None
+        or cpx_sparse is None
+        or cpx_spsolve_triangular is None
+    ):
+        return None, None
+    try:
+        warmup, iters = _spsv_benchmark_schedule(int(data.numel()), op_mode, data.dtype, fmt="CSR")
+        data_ref, b_ref = _sparse_ref_inputs(data, b)
+        data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data_ref.contiguous()))
+        idx_cp = cp.from_dlpack(
+            torch.utils.dlpack.to_dlpack(indices.to(torch.int64).contiguous())
+        )
+        ptr_cp = cp.from_dlpack(
+            torch.utils.dlpack.to_dlpack(indptr.to(torch.int64).contiguous())
+        )
+        b_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(b_ref.contiguous()))
+        A_cp = cpx_sparse.csr_matrix((data_cp, idx_cp, ptr_cp), shape=shape)
+        if op_mode == "TRANS":
+            A_eff = A_cp.transpose().tocsr()
+            lower_eff = not lower
+        elif op_mode == "CONJ":
+            A_eff = A_cp.transpose().conj().tocsr()
+            lower_eff = not lower
+        else:
+            A_eff = A_cp
+            lower_eff = lower
+
+        for _ in range(warmup):
+            _ = cpx_spsolve_triangular(
+                A_eff, b_cp, lower=lower_eff, unit_diagonal=False
+            )
+        cp.cuda.runtime.deviceSynchronize()
+        c0 = cp.cuda.Event()
+        c1 = cp.cuda.Event()
+        c0.record()
+        for _ in range(iters):
+            x_cp = cpx_spsolve_triangular(
+                A_eff, b_cp, lower=lower_eff, unit_diagonal=False
+            )
+        c1.record()
+        c1.synchronize()
+        ms = cp.cuda.get_elapsed_time(c0, c1) / iters
+        x_t = torch.utils.dlpack.from_dlpack(x_cp.toDlpack()).to(b.dtype)
+        return ms, x_t
+    except Exception:
+        return None, None
 
 
 def run_spsv_synthetic_all(lower=True, alg_num=None):
@@ -1031,8 +866,6 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
     )
     print(f"Triangle: {'LOWER' if lower else 'UPPER'}")
     print(f"Algorithm: {_alg_label(alg_num)}")
-    if alg_num is not None:
-        print("Route note: explicit alg_num applies to NON only; TRANS/CONJ use transpose_cw.")
     print()
 
     hdr = (
@@ -1055,12 +888,20 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
             print("-" * 110)
             for n in TEST_SIZES:
                 for fmt in ("CSR", "COO"):
-                    op_modes = _supported_spsv_ops(value_dtype, index_dtype)
+                    op_modes = (
+                        _supported_csr_full_ops(value_dtype, index_dtype)
+                        if fmt == "CSR"
+                        else ["NON"]
+                    )
                     for op_mode in op_modes:
+                        if not _alg_num_supports_case(
+                            alg_num, fmt, op_mode, lower, value_dtype
+                        ):
+                            continue
                         data, indices, indptr, shape = _build_random_triangular_csr(
                             n, value_dtype, index_dtype, device, lower=lower
                         )
-                        rhs_op = op_mode
+                        rhs_op = op_mode if fmt == "CSR" else "NON"
                         b = _random_rhs_for_spsv(
                             shape,
                             value_dtype,
@@ -1087,7 +928,7 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
                                 shape,
                                 lower=lower,
                                 transpose=op_mode,
-                                solve_kind=_solve_kind_for_case(alg_num, op_mode),
+                                solve_kind=_solve_kind_from_alg_num(alg_num),
                             )
                         else:
                             dc, rr, cc = _csr_to_coo(
@@ -1101,7 +942,7 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
                                 shape,
                                 lower=lower,
                                 transpose=op_mode,
-                                solve_kind=_solve_kind_for_case(alg_num, op_mode),
+                                solve_kind=_solve_kind_from_alg_num(alg_num),
                             )
                         torch.cuda.synchronize()
 
@@ -1124,17 +965,8 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
                         err_hs = None
                         x_hs_t = None
                         if fmt == "CSR":
-                            hipsparse_ms, x_hs_t = _benchmark_sparse_ref_spsv(
-                                "CSR",
-                                data,
-                                indices,
-                                indptr,
-                                shape,
-                                b,
-                                lower=lower,
-                                op_mode=op_mode,
-                                warmup=WARMUP,
-                                iters=ITERS,
+                            hipsparse_ms, x_hs_t = _benchmark_sparse_ref_csr_with_op(
+                                data, indices, indptr, shape, b, op_mode, lower
                             )
                         elif value_dtype in (
                             torch.float32,
@@ -1142,17 +974,16 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
                             torch.complex64,
                             torch.complex128,
                         ):
-                            hipsparse_ms, x_hs_t = _benchmark_sparse_ref_spsv(
-                                "CSR",
+                            hipsparse_ms, x_hs_t = _benchmark_sparse_ref_lower_csr_or_coo(
+                                fmt,
                                 data,
                                 indices,
                                 indptr,
                                 shape,
                                 b,
-                                lower=lower,
-                                op_mode=op_mode,
-                                warmup=WARMUP,
-                                iters=ITERS,
+                                WARMUP,
+                                ITERS,
+                                lower,
                             )
                         if x_hs_t is not None and n > 0:
                             err_hs = float(
@@ -1166,16 +997,11 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
                             else False
                         )
                         ok_hs = (
-                            torch.allclose(x, x_hs_t, atol=atol, rtol=rtol)
-                            if x_hs_t is not None
-                            else False
+                            True
+                            if x_hs_t is None
+                            else torch.allclose(x, x_hs_t, atol=atol, rtol=rtol)
                         )
-                        ok = _reference_pass_status(
-                            ok_pt,
-                            x_pt is not None,
-                            ok_hs,
-                            x_hs_t is not None,
-                        )
+                        ok = ok_pt or ok_hs
                         status = "PASS" if ok else "FAIL"
                         if not ok:
                             failed += 1
@@ -1234,17 +1060,13 @@ def _run_one_csv_row_coo(path, value_dtype, index_dtype, op_mode, device, lower=
         shape,
         lower=lower,
         transpose=op_mode,
-        solve_kind=_solve_kind_for_case(alg_num, op_mode),
+        solve_kind=_solve_kind_from_alg_num(alg_num),
     )
     return _finalize_csv_row(
         path,
-        "COO",
         value_dtype,
         index_dtype,
         op_mode,
-        d_in,
-        r_in,
-        c_in,
         data,
         indices,
         indptr,
@@ -1261,13 +1083,9 @@ def _run_one_csv_row_coo(path, value_dtype, index_dtype, op_mode, device, lower=
 
 def _finalize_csv_row(
     path,
-    fmt,
     value_dtype,
     index_dtype,
     op_mode,
-    sparse_ref_data,
-    sparse_ref_indices,
-    sparse_ref_indptr,
     data,
     indices,
     indptr,
@@ -1312,21 +1130,8 @@ def _finalize_csv_row(
     err_hs = None
     ok_hs = False
     x_hs_t = None
-    hipsparse_ms, x_hs_t = _benchmark_sparse_ref_spsv_for_csv(
-        path,
-        fmt,
-        sparse_ref_data,
-        sparse_ref_indices,
-        sparse_ref_indptr,
-        data,
-        indices,
-        indptr,
-        shape,
-        b,
-        lower=lower,
-        op_mode=op_mode,
-        value_dtype=value_dtype,
-        index_dtype=index_dtype,
+    hipsparse_ms, x_hs_t = _benchmark_sparse_ref_csr_with_op(
+        data, indices, indptr, shape, b, op_mode, lower
     )
     if x_hs_t is not None:
         x_cmp = x
@@ -1338,15 +1143,11 @@ def _finalize_csv_row(
         )
         ok_hs = torch.allclose(x_cmp, x_hs_cmp, atol=atol, rtol=rtol)
 
-    status = "PASS" if _reference_pass_status(
-        ok_pt,
-        x_ref is not None,
-        ok_hs,
-        x_hs_t is not None,
-    ) else "FAIL"
+    status = "PASS" if (ok_pt or ok_hs) else "FAIL"
     if (not ok_pt) and (not ok_hs) and (err_pt is None and err_hs is None):
         status = "REF_FAIL"
-    err_ref = _reference_error_summary(err_pt, err_hs)
+    ref_errors = [err for err in (err_pt, err_hs) if err is not None]
+    err_ref = min(ref_errors) if ref_errors else None
 
     row = {
         "matrix": os.path.basename(path),
@@ -1407,17 +1208,13 @@ def _run_one_csv_row_csr_full(path, value_dtype, index_dtype, op_mode, device, l
         shape,
         lower=lower,
         transpose=op_mode,
-        solve_kind=_solve_kind_for_case(alg_num, op_mode),
+        solve_kind=_solve_kind_from_alg_num(alg_num),
     )
-    return _finalize_csv_row(
+    return _finalize_csv_row_csr_full(
         path,
-        "CSR",
         value_dtype,
         index_dtype,
         op_mode,
-        data,
-        indices,
-        indptr,
         data,
         indices,
         indptr,
@@ -1430,6 +1227,104 @@ def _run_one_csv_row_csr_full(path, value_dtype, index_dtype, op_mode, device, l
         n_cols,
         lower=lower,
     )
+
+
+def _finalize_csv_row_csr_full(
+    path,
+    value_dtype,
+    index_dtype,
+    op_mode,
+    data,
+    indices,
+    indptr,
+    shape,
+    x,
+    analysis_ms,
+    t_ms,
+    b,
+    n_rows,
+    n_cols,
+    lower=True,
+):
+    atol, rtol = _tol_for_dtype(value_dtype)
+    err_res = _solution_residual_metrics(
+        data, indices, indptr, shape, x, b, value_dtype, op_mode
+    )
+
+    pytorch_ms = None
+    err_pt = None
+    ok_pt = False
+    pt_skip_reason = None
+    x_ref, pytorch_ms, _pt_backend, pt_skip_reason = _benchmark_pytorch_reference(
+        data,
+        indices,
+        indptr,
+        shape,
+        b,
+        lower=lower,
+        op_mode=op_mode,
+    )
+    if x_ref is not None:
+        x_cmp = x
+        x_ref_cmp = x_ref
+        err_pt = (
+            float(torch.max(torch.abs(x_cmp - x_ref_cmp)).item())
+            if n_rows > 0
+            else 0.0
+        )
+        ok_pt = torch.allclose(x_cmp, x_ref_cmp, atol=atol, rtol=rtol)
+
+    hipsparse_ms = None
+    err_hs = None
+    ok_hs = False
+    x_hs_t = None
+    hipsparse_ms, x_hs_t = _benchmark_sparse_ref_csr_with_op(
+        data, indices, indptr, shape, b, op_mode, lower
+    )
+    if x_hs_t is not None:
+        x_cmp = x
+        x_hs_cmp = x_hs_t
+        err_hs = (
+            float(torch.max(torch.abs(x_cmp - x_hs_cmp)).item())
+            if n_rows > 0
+            else 0.0
+        )
+        ok_hs = torch.allclose(x_cmp, x_hs_cmp, atol=atol, rtol=rtol)
+
+    status = "PASS" if (ok_pt or ok_hs) else "FAIL"
+    if (not ok_pt) and (not ok_hs) and (err_pt is None and err_hs is None):
+        status = "REF_FAIL"
+    ref_errors = [err for err in (err_pt, err_hs) if err is not None]
+    err_ref = min(ref_errors) if ref_errors else None
+
+    row = {
+        "matrix": os.path.basename(path),
+        "value_dtype": _dtype_name(value_dtype),
+        "index_dtype": _dtype_name(index_dtype),
+        "opA": op_mode,
+        "n_rows": n_rows,
+        "n_cols": n_cols,
+        "nnz": int(data.numel()),
+        "analysis_ms": analysis_ms,
+        "solve_ms": t_ms,
+        "triton_total_ms": _sum_ms(analysis_ms, t_ms),
+        "hipsparse_ms": hipsparse_ms,
+        "pytorch_ms": pytorch_ms,
+        "hipsparse_speedup_solve": _safe_ratio(hipsparse_ms, t_ms),
+        "pytorch_speedup_solve": _safe_ratio(pytorch_ms, t_ms),
+        "hipsparse_speedup_total": _safe_ratio(hipsparse_ms, _sum_ms(analysis_ms, t_ms)),
+        "pytorch_speedup_total": _safe_ratio(pytorch_ms, _sum_ms(analysis_ms, t_ms)),
+        "pt_status": _status_str(ok_pt, err_pt is not None),
+        "hs_status": _status_str(ok_hs, err_hs is not None),
+        "status": status,
+        "err_ref": err_ref,
+        "err_res": err_res,
+        "err_pt": err_pt,
+        "err_hs": err_hs,
+        "pytorch_reason": pt_skip_reason,
+        "error": None,
+    }
+    return row, pt_skip_reason
 
 
 def run_all_supported_spsv_csr_csv(
@@ -1452,28 +1347,22 @@ def run_all_supported_spsv_csr_csv(
     for value_dtype in selected_value_dtypes:
         for index_dtype in selected_index_dtypes:
             supported_op_modes = [
-                op for op in _supported_spsv_ops(value_dtype, index_dtype)
+                op for op in _supported_csr_full_ops(value_dtype, index_dtype)
                 if op in selected_op_modes
             ]
             for op_mode in supported_op_modes:
+                if not _alg_num_supports_case(
+                    alg_num, "CSR", op_mode, lower, value_dtype
+                ):
+                    continue
                 print("=" * 150)
                 print(
                     f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}  |  CSR  |  triA={'LOWER' if lower else 'UPPER'}  |  opA={op_mode}"
                 )
                 print(f"Algorithm: {_alg_label(alg_num)}")
-                alg_note = _alg_note_for_op(alg_num, op_mode)
-                if alg_note is not None:
-                    print(f"Route note: {alg_note}")
-                pt_note = _pytorch_ref_policy_note(op_mode)
-                if pt_note is not None:
-                    print(f"Reference note: {pt_note}")
                 print(
-                    "Formats: FlagSparse=CSR, hipSPARSE=CSR ref"
-                    + (
-                        ", PyTorch(ms)=secondary diagnostic reference"
-                        if _prefer_hipsparse_reference()
-                        else ", PyTorch(ms)=official sparse solve reference"
-                    )
+                    "Formats: FlagSparse=CSR, hipSPARSE=CSR ref, "
+                    "PyTorch(ms)=official sparse solve reference"
                 )
                 print(
                     f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
@@ -1626,33 +1515,24 @@ def run_all_dtypes_spsv_coo_csv(
     for value_dtype in selected_value_dtypes:
         for index_dtype in selected_index_dtypes:
             supported_op_modes = [
-                op for op in _supported_spsv_ops(value_dtype, index_dtype)
+                op for op in _supported_csr_full_ops(value_dtype, index_dtype)
                 if op in (op_modes or SPSV_OP_MODES)
             ]
             for op_mode in supported_op_modes:
+                if not _alg_num_supports_case(
+                    alg_num, "COO", op_mode, lower, value_dtype
+                ):
+                    continue
                 print("=" * 150)
                 print(
                     f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}  |  COO"
                     f"  triA={'LOWER' if lower else 'UPPER'}  |  opA={op_mode}"
                 )
                 print(f"Algorithm: {_alg_label(alg_num)}")
-                alg_note = _alg_note_for_op(alg_num, op_mode)
-                if alg_note is not None:
-                    print(f"Route note: {alg_note}")
-                pt_note = _pytorch_ref_policy_note(op_mode)
-                if pt_note is not None:
-                    print(f"Reference note: {pt_note}")
                 print(
-                    (
-                        "Formats: FlagSparse=COO input routed through CSR SpSV, "
-                        "hipSPARSE=COO input canonicalized through CSR ref, "
-                        + (
-                            "PyTorch(ms)=secondary diagnostic reference. "
-                            if _prefer_hipsparse_reference()
-                            else "PyTorch(ms)=official sparse solve reference. "
-                        )
-                        + "RHS is generated directly."
-                    )
+                    "Formats: FlagSparse=COO input routed through CSR SpSV, hipSPARSE=CSR ref, "
+                    "PyTorch(ms)=official sparse solve reference. "
+                    "RHS is generated directly."
                 )
                 print(
                     f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
@@ -1974,92 +1854,8 @@ def run_csr_transpose_check(
     print(f"Total cases: {total}  Failed: {failed}")
 
 
-def _run_spsv_reference_worker(args):
-    if not torch.cuda.is_available():
-        payload = {
-            "success": False,
-            "reason": "CUDA is not available in worker",
-        }
-        torch.save(payload, args._worker_output)
-        return 1
-    value_dtype = VALUE_DTYPE_NAME_MAP[str(args._worker_value_dtype).lower()]
-    index_dtype = INDEX_DTYPE_NAME_MAP[str(args._worker_index_dtype).lower()]
-    op_mode = str(args._worker_op).upper()
-    lower = not bool(args.upper)
-    device = torch.device("cuda")
-    data, indices, indptr, shape = _load_mtx_to_csr_torch(
-        args._worker_mtx,
-        dtype=value_dtype,
-        device=device,
-        lower=lower,
-    )
-    indices = indices.to(index_dtype)
-    indptr = indptr.to(index_dtype)
-    seed_prefix = "csv-csr" if str(args._spsv_ref_worker).upper() == "CSR" else "csv-coo"
-    b = _random_rhs_for_spsv(
-        shape,
-        value_dtype,
-        device,
-        op_mode=op_mode,
-        seed=_stable_case_seed(
-            seed_prefix,
-            os.path.basename(args._worker_mtx),
-            "LOWER" if lower else "UPPER",
-            op_mode,
-            _dtype_name(value_dtype),
-            _dtype_name(index_dtype),
-        ),
-    )
-    try:
-        if str(args._spsv_ref_worker).upper() == "COO":
-            data_in, row_in, col_in = _coo_inputs_for_csv(
-                data, indices, indptr, shape, index_dtype=index_dtype
-            )
-            result = fs_spsv_impl._benchmark_spsv_coo_sparse_ref(
-                data_in,
-                row_in,
-                col_in,
-                b,
-                shape,
-                lower=lower,
-                unit_diagonal=False,
-                op=str(op_mode).lower(),
-                warmup=max(0, int(args.warmup)),
-                iters=max(1, int(args.iters)),
-            )
-        else:
-            result = fs_spsv_impl._benchmark_spsv_csr_sparse_ref(
-                data,
-                indices,
-                indptr,
-                b,
-                shape,
-                lower=lower,
-                unit_diagonal=False,
-                op=str(op_mode).lower(),
-                warmup=max(0, int(args.warmup)),
-                iters=max(1, int(args.iters)),
-            )
-        values = result.get("values")
-        payload = {
-            "success": values is not None,
-            "reason": result.get("reason"),
-            "ms": result.get("ms"),
-            "values": None if values is None else values.detach().to("cpu"),
-        }
-    except Exception as exc:
-        payload = {
-            "success": False,
-            "reason": str(exc),
-            "ms": None,
-            "values": None,
-        }
-    torch.save(payload, args._worker_output)
-    return 0 if payload.get("success") else 1
-
-
 def main():
-    global WARMUP, ITERS, PYTORCH_REF_MODE
+    global WARMUP, ITERS
     parser = argparse.ArgumentParser(
         description="SpSV test: synthetic triangular systems and optional .mtx (CSR/COO), same baselines as CSR."
     )
@@ -2126,15 +1922,6 @@ def main():
         help="Comma-separated index dtype filter for CSR CSV, e.g. int32,int64",
     )
     parser.add_argument(
-        "--pytorch-ref",
-        type=_parse_pytorch_ref_mode,
-        default=PYTORCH_REF_MODE,
-        help=(
-            "PyTorch sparse reference mode: auto keeps NON on and auto-skips "
-            "TRANS/CONJ on ROCm for stability; on forces it; off disables it."
-        ),
-    )
-    parser.add_argument(
         "--warmup",
         type=int,
         default=WARMUP,
@@ -2146,25 +1933,9 @@ def main():
         default=ITERS,
         help="Benchmark timed iterations (Library-main style default: 1)",
     )
-    parser.add_argument("--_spsv-ref-worker", type=str, choices=["csr", "coo"], default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--_worker-mtx", type=str, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--_worker-output", type=str, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--_worker-value-dtype", type=str, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--_worker-index-dtype", type=str, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--_worker-op", type=str, default="NON", help=argparse.SUPPRESS)
     args = parser.parse_args()
     WARMUP = max(0, int(args.warmup))
     ITERS = max(1, int(args.iters))
-    PYTORCH_REF_MODE = args.pytorch_ref
-    if args._spsv_ref_worker is not None:
-        if (
-            not args._worker_mtx
-            or not args._worker_output
-            or not args._worker_value_dtype
-            or not args._worker_index_dtype
-        ):
-            raise SystemExit("worker mode requires matrix, output, value dtype, and index dtype")
-        raise SystemExit(_run_spsv_reference_worker(args))
     lower = not args.upper
     if args.alg_num in (2, 3, 4, 8):
         if args.check_transpose:
