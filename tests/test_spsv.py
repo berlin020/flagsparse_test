@@ -678,35 +678,6 @@ def _benchmark_flagsparse_spsv_csr_reuse(
     )
 
 
-def _benchmark_flagsparse_spsv_csr(
-    data,
-    indices,
-    indptr,
-    b,
-    shape,
-    *,
-    lower=True,
-    transpose=False,
-    solve_kind=None,
-    warmup=WARMUP,
-    iters=ITERS,
-):
-    return _benchmark_flagsparse(
-        lambda: fs.flagsparse_spsv_csr(
-            data,
-            indices,
-            indptr,
-            b,
-            shape,
-            lower=lower,
-            transpose=transpose,
-            solve_kind=solve_kind,
-        ),
-        warmup=warmup,
-        iters=iters,
-    )
-
-
 def _benchmark_flagsparse_spsv_csr_split(
     data,
     indices,
@@ -725,32 +696,6 @@ def _benchmark_flagsparse_spsv_csr_split(
         data.dtype,
         fmt="CSR",
     )
-    if op_mode != "N":
-        analysis_ms = fs_spsv_impl._analyze_spsv_csr(
-            data,
-            indices,
-            indptr,
-            b,
-            shape,
-            lower=lower,
-            transpose=transpose,
-            solve_kind=solve_kind,
-            clear_cache=True,
-            return_time=True,
-        )
-        x, solve_ms = _benchmark_flagsparse_spsv_csr(
-            data,
-            indices,
-            indptr,
-            b,
-            shape,
-            lower=lower,
-            transpose=transpose,
-            solve_kind=solve_kind,
-            warmup=warmup,
-            iters=iters,
-        )
-        return x, analysis_ms, solve_ms
     descr, workspace, analysis_ms = _analyze_flagsparse_spsv_csr_reuse(
         data,
         indices,
@@ -798,32 +743,6 @@ def _benchmark_flagsparse_spsv_coo_split(
         data.dtype,
         fmt="COO",
     )
-    if trans_mode != "N":
-        analysis_ms = fs_spsv_impl._analyze_spsv_csr(
-            data_csr,
-            indices_csr,
-            indptr_csr,
-            b,
-            (n_rows, n_cols),
-            lower=lower,
-            transpose=transpose,
-            solve_kind=solve_kind,
-            clear_cache=True,
-            return_time=True,
-        )
-        x, solve_ms = _benchmark_flagsparse_spsv_csr(
-            data_csr,
-            indices_csr,
-            indptr_csr,
-            b,
-            (n_rows, n_cols),
-            lower=lower,
-            transpose=transpose,
-            solve_kind=solve_kind,
-            warmup=warmup,
-            iters=iters,
-        )
-        return x, analysis_ms, solve_ms
     descr, workspace, analysis_ms = _analyze_flagsparse_spsv_csr_reuse(
         data_csr,
         indices_csr,
@@ -1016,6 +935,9 @@ def _benchmark_sparse_ref_spsv_for_csv(
     sparse_ref_data,
     sparse_ref_indices,
     sparse_ref_indptr,
+    csr_data,
+    csr_indices,
+    csr_indptr,
     shape,
     b,
     *,
@@ -1024,6 +946,52 @@ def _benchmark_sparse_ref_spsv_for_csv(
     value_dtype,
     index_dtype,
 ):
+    fmt_name = str(fmt).strip().upper()
+    op_name = str(op_mode).strip().upper()
+    if fmt_name == "COO":
+        if op_name == "NON":
+            return _benchmark_sparse_ref_spsv(
+                "CSR",
+                csr_data,
+                csr_indices,
+                csr_indptr,
+                shape,
+                b,
+                lower=lower,
+                op_mode=op_mode,
+            )
+        if fs_spsv_impl._is_rocm_runtime():
+            return _run_spsv_sparse_ref_worker_subprocess(
+                "csr",
+                path,
+                value_dtype,
+                index_dtype,
+                op_mode,
+                lower=lower,
+                warmup=WARMUP,
+                iters=ITERS,
+            )
+        return _benchmark_sparse_ref_spsv(
+            "CSR",
+            csr_data,
+            csr_indices,
+            csr_indptr,
+            shape,
+            b,
+            lower=lower,
+            op_mode=op_mode,
+        )
+    if op_name == "NON":
+        return _benchmark_sparse_ref_spsv(
+            fmt,
+            sparse_ref_data,
+            sparse_ref_indices,
+            sparse_ref_indptr,
+            shape,
+            b,
+            lower=lower,
+            op_mode=op_mode,
+        )
     if fs_spsv_impl._is_rocm_runtime():
         return _run_spsv_sparse_ref_worker_subprocess(
             fmt,
@@ -1092,7 +1060,7 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
                         data, indices, indptr, shape = _build_random_triangular_csr(
                             n, value_dtype, index_dtype, device, lower=lower
                         )
-                        rhs_op = op_mode if fmt == "CSR" else "NON"
+                        rhs_op = op_mode
                         b = _random_rhs_for_spsv(
                             shape,
                             value_dtype,
@@ -1110,9 +1078,6 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
                         )
 
                         torch.cuda.synchronize()
-                        ref_data = data
-                        ref_indices = indices
-                        ref_indptr = indptr
                         if fmt == "CSR":
                             x, analysis_ms, t_ms = _benchmark_flagsparse_spsv_csr_split(
                                 data,
@@ -1128,7 +1093,6 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
                             dc, rr, cc = _csr_to_coo(
                                 data, indices, indptr, shape, index_dtype=index_dtype
                             )
-                            ref_data, ref_indices, ref_indptr = dc, rr, cc
                             x, analysis_ms, t_ms = _benchmark_flagsparse_spsv_coo_split(
                                 dc,
                                 rr,
@@ -1179,10 +1143,10 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
                             torch.complex128,
                         ):
                             hipsparse_ms, x_hs_t = _benchmark_sparse_ref_spsv(
-                                fmt,
-                                ref_data,
-                                ref_indices,
-                                ref_indptr,
+                                "CSR",
+                                data,
+                                indices,
+                                indptr,
                                 shape,
                                 b,
                                 lower=lower,
@@ -1354,6 +1318,9 @@ def _finalize_csv_row(
         sparse_ref_data,
         sparse_ref_indices,
         sparse_ref_indptr,
+        data,
+        indices,
+        indptr,
         shape,
         b,
         lower=lower,

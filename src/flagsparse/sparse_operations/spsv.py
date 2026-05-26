@@ -1751,6 +1751,7 @@ def _build_spsv_nnz_balance_launch_order(indptr64, n_rows, *, lower):
 def _supports_spsv_advanced_nontrans_routes(trans_mode, lower, unit_diagonal, value_dtype):
     return (
         trans_mode == "N"
+        and bool(lower)
         and (not bool(unit_diagonal))
         and value_dtype in (torch.float32, torch.float64, torch.complex64, torch.complex128)
     )
@@ -1764,12 +1765,7 @@ def _choose_spsv_nontrans_auto_route(
     unit_diagonal,
     value_dtype,
 ):
-    """Heuristic route picker for NON_TRANS triangular solves.
-
-    This is an analysis-time auto selector, not a runtime autotuner.  The goal
-    is to keep default routing predictable while still steering obviously
-    serialized systems and wide-frontier systems onto more suitable kernels.
-    """
+    """Pick the stable default NON route used by the known-good e3268c9 flow."""
 
     if bool(unit_diagonal):
         return "csr_cw"
@@ -1778,52 +1774,9 @@ def _choose_spsv_nontrans_auto_route(
         return "csr_cw"
 
     if not lower:
-        # The 2026-05-25 upper NON benchmark sweep favors ALG4 (csr_smblk)
-        # overwhelmingly on one-shot interface time for both real and complex
-        # dtypes, so AUTO follows that route directly for upper solves.
-        if value_dtype in (torch.float32, torch.float64, torch.complex64, torch.complex128):
-            return "csr_smblk"
         return "csr_cw"
 
-    if value_dtype not in (torch.float32, torch.float64):
-        # Keep lower AUTO conservative for complex dtypes until a lower-side
-        # benchmark sweep justifies a more aggressive default.
-        return "csr_cw"
-
-    num_levels = int(matrix_stats.get("num_levels", 0))
-    max_frontier = int(matrix_stats.get("max_frontier", n_rows))
-    avg_frontier = float(matrix_stats.get("avg_frontier", float(max_frontier)))
-    frontier_ratio = float(
-        matrix_stats.get("frontier_ratio", (float(max_frontier) / float(n_rows)) if n_rows > 0 else 0.0)
-    )
-    avg_nnz_per_row = float(matrix_stats.get("avg_nnz_per_row", 0.0))
-    max_nnz_per_row = int(matrix_stats.get("max_nnz_per_row", 0))
-
-    wide_frontier = (
-        max_frontier >= max(32, min(n_rows, 64))
-        or avg_frontier >= 8.0
-        or frontier_ratio >= 0.10
-    )
-
-    serialized = (
-        n_rows >= 128
-        and num_levels >= max(32, n_rows // 8)
-        and max_frontier <= 2
-        and avg_frontier <= 2.0
-        and frontier_ratio <= 0.02
-    )
-    moderately_light_rows = avg_nnz_per_row <= 256.0 and max_nnz_per_row <= 512
-    if serialized and moderately_light_rows:
-        return "csr_nnz_balance"
-    if wide_frontier:
-        return "csr_cw_levelschd"
-
-    if avg_nnz_per_row <= 48.0 and max_nnz_per_row <= 128 and frontier_ratio <= 0.05:
-        return "csr_roc"
-
-    if avg_nnz_per_row >= 48.0 or max_nnz_per_row >= 128:
-        return "csr_smblk"
-
+    del matrix_stats, value_dtype
     return "csr_smblk"
 
 
