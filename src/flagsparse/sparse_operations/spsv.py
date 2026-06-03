@@ -1330,9 +1330,9 @@ def _spsv_csc_preprocess_kernel(
         mask = offsets < end
         row = tl.load(indices_ptr + offsets, mask=mask, other=0)
         if LOWER:
-            dep_mask = mask & (row > col)
-        else:
             dep_mask = mask & (row < col)
+        else:
+            dep_mask = mask & (row > col)
         tl.atomic_add(indegree_ptr + row, 1, mask=dep_mask)
 
 
@@ -2635,9 +2635,9 @@ def _spsv_csr_transpose_cw_kernel(
             a = tl.load(data_ptr + offsets, mask=mask, other=0.0)
             col = tl.load(indices_ptr + offsets, mask=mask, other=0)
             if LOWER:
-                target_mask = mask & (col > row)
-            else:
                 target_mask = mask & (col < row)
+            else:
+                target_mask = mask & (col > row)
             _propagate_then_release_real(
                 residual_ptr, indegree_ptr, col, -a * x_row, target_mask
             )
@@ -2744,9 +2744,9 @@ def _spsv_csr_transpose_cw_kernel_complex(
                 a_re = a_re.to(tl.float32)
                 a_im = a_im.to(tl.float32)
             if LOWER:
-                target_mask = mask & (col > row)
-            else:
                 target_mask = mask & (col < row)
+            else:
+                target_mask = mask & (col > row)
             prod_re = a_re * x_re_out - a_im * x_im_out
             prod_im = a_re * x_im_out + a_im * x_re_out
             _propagate_then_release_complex(
@@ -4006,7 +4006,7 @@ def _triton_spsv_csr_transpose_cw_vector(
         BLOCK_NNZ=block_nnz_use,
         MAX_SEGMENTS=max_segments_use,
         LOWER=lower,
-        REVERSE_ORDER=not lower,
+        REVERSE_ORDER=lower,
         UNIT_DIAG=unit_diagonal,
         DIAG_EPS=diag_eps,
     )
@@ -4095,7 +4095,7 @@ def _triton_spsv_csr_transpose_cw_vector_complex(
         BLOCK_NNZ=block_nnz_use,
         MAX_SEGMENTS=max_segments_use,
         LOWER=lower,
-        REVERSE_ORDER=not lower,
+        REVERSE_ORDER=lower,
         UNIT_DIAG=unit_diagonal,
         CONJ_TRANS=conjugate,
         USE_FP64_ACC=use_fp64,
