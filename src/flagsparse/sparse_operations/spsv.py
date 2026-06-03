@@ -1367,9 +1367,9 @@ def _spsv_csc_preprocess_kernel(
         mask = offsets < end
         row = tl.load(indices_ptr + offsets, mask=mask, other=0)
         if LOWER:
-            dep_mask = mask & (row < col)
-        else:
             dep_mask = mask & (row > col)
+        else:
+            dep_mask = mask & (row < col)
         tl.atomic_add(indegree_ptr + row, 1, mask=dep_mask)
 
 
@@ -2201,26 +2201,39 @@ def _prepare_spsv_csr_system(
     storage_view = _normalize_spsv_storage_view(storage_view)
     if storage_view != "csr_as_csc":
         raise ValueError("TRANS/CONJ SpSV only supports storage_view='csr_as_csc'")
-    matrix_stats = _build_spsv_cw_matrix_stats(indptr64, n_rows)
-    default_block_nnz, default_max_segments = _choose_transpose_family_launch_config(
-        indptr64
+    data_t, indices_t64, indptr_t64 = _csr_transpose(
+        data,
+        indices64,
+        indptr64,
+        n_rows,
+        n_cols,
+        conjugate=(trans_mode == "C"),
     )
+    matrix_stats = _build_spsv_cw_matrix_stats(indptr_t64, n_cols)
+    default_block_nnz, default_max_segments = _auto_spsv_launch_config(
+        indptr_t64
+    )
+    if lower_eff:
+        nontrans_variant = "csr_u_lo_cw" if unit_diagonal else "csr_n_lo_cw"
+    else:
+        nontrans_variant = "csr_u_up_cw" if unit_diagonal else "csr_n_up_cw"
     cw_plan = {
-        "solve_kind": "transpose_cw",
-        "default_solve_kind": "transpose_cw",
-        "supported_solve_kinds": ("transpose_cw",),
-        "kernel_data": data,
-        "kernel_indices32": indices64.to(torch.int32),
-        "kernel_indptr64": indptr64,
+        "solve_kind": "csr_cw",
+        "default_solve_kind": "csr_cw",
+        "supported_solve_kinds": ("csr_cw",),
+        "nontrans_variant": nontrans_variant,
+        "kernel_data": data_t,
+        "kernel_indices32": indices_t64.to(torch.int32),
+        "kernel_indptr64": indptr_t64,
         "lower_eff": lower_eff,
         "default_block_nnz": default_block_nnz,
         "default_max_segments": default_max_segments,
         "cw_worker_count": _cw_worker_count(
-            n_rows, matrix_stats["max_frontier"], matrix_stats["avg_nnz_per_row"], 1
+            n_cols, matrix_stats["max_frontier"], matrix_stats["avg_nnz_per_row"], 1
         ),
         "matrix_stats": matrix_stats,
-        "storage_view": storage_view,
-        "route_name": "transpose_cw",
+        "storage_view": "csr_transpose_materialized",
+        "route_name": "transpose_materialized_cw",
     }
     _attach_spsv_complex_plan_views(cw_plan)
     return cw_plan
@@ -2672,9 +2685,9 @@ def _spsv_csr_transpose_cw_kernel(
             a = tl.load(data_ptr + offsets, mask=mask, other=0.0)
             col = tl.load(indices_ptr + offsets, mask=mask, other=0)
             if LOWER:
-                target_mask = mask & (col < row)
-            else:
                 target_mask = mask & (col > row)
+            else:
+                target_mask = mask & (col < row)
             _propagate_then_release_real(
                 residual_ptr, indegree_ptr, col, -a * x_row, target_mask
             )
@@ -2781,9 +2794,9 @@ def _spsv_csr_transpose_cw_kernel_complex(
                 a_re = a_re.to(tl.float32)
                 a_im = a_im.to(tl.float32)
             if LOWER:
-                target_mask = mask & (col < row)
-            else:
                 target_mask = mask & (col > row)
+            else:
+                target_mask = mask & (col < row)
             prod_re = a_re * x_re_out - a_im * x_im_out
             prod_im = a_re * x_im_out + a_im * x_re_out
             _propagate_then_release_complex(
@@ -4043,7 +4056,7 @@ def _triton_spsv_csr_transpose_cw_vector(
         BLOCK_NNZ=block_nnz_use,
         MAX_SEGMENTS=max_segments_use,
         LOWER=lower,
-        REVERSE_ORDER=lower,
+        REVERSE_ORDER=not lower,
         UNIT_DIAG=unit_diagonal,
         DIAG_EPS=diag_eps,
     )
@@ -4132,7 +4145,7 @@ def _triton_spsv_csr_transpose_cw_vector_complex(
         BLOCK_NNZ=block_nnz_use,
         MAX_SEGMENTS=max_segments_use,
         LOWER=lower,
-        REVERSE_ORDER=lower,
+        REVERSE_ORDER=not lower,
         UNIT_DIAG=unit_diagonal,
         CONJ_TRANS=conjugate,
         USE_FP64_ACC=use_fp64,
