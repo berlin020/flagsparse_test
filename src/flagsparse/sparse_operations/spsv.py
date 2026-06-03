@@ -1,5 +1,8 @@
 """Sparse triangular solve (SpSV) CSR/COO."""
 
+import ctypes
+
+from . import _common as _common_mod
 from ._common import *
 
 from collections import OrderedDict
@@ -9,6 +12,18 @@ import os
 import time
 import triton
 import triton.language as tl
+
+hip = _common_mod.hip
+hipsparse = _common_mod.hipsparse
+HipPointer = _common_mod.HipPointer
+_benchmark_prepared_cuda_op = _common_mod._benchmark_prepared_cuda_op
+_hip_check_result = _common_mod._hip_check_result
+_hipsparse_lookup = _common_mod._hipsparse_lookup
+_hipsparse_unavailable_reason = _common_mod._hipsparse_unavailable_reason
+_hipsparse_value_type = _common_mod._hipsparse_value_type
+_hipsparse_scalar = _common_mod._hipsparse_scalar
+_hipsparse_index_type = _common_mod._hipsparse_index_type
+_hipsparse_spmv_operation = _common_mod._hipsparse_spmv_operation
 
 SUPPORTED_SPSV_VALUE_DTYPES = (
     torch.float32,
@@ -50,6 +65,79 @@ SPSV_PROMOTE_TRANSPOSE_COMPLEX64_TO_COMPLEX128 = _spsv_env_flag(
 )
 _SPSV_CSR_PREPROCESS_CACHE = OrderedDict()
 _SPSV_CSR_PREPROCESS_CACHE_SIZE = 8
+
+
+def _hipsparse_spsv_op(op):
+    return _hipsparse_spmv_operation(op, "hipSPARSE CSR SpSV")
+
+
+def _hipsparse_spmat_attribute(name):
+    mapping = {
+        "fill_mode": ("HIPSPARSE_SPMAT_FILL_MODE",),
+        "diag_type": ("HIPSPARSE_SPMAT_DIAG_TYPE",),
+    }
+    if name not in mapping:
+        raise RuntimeError(f"Unsupported hipSPARSE SpMat attribute: {name}")
+    return _hipsparse_lookup("hipsparseSpMatAttribute_t", mapping[name])
+
+
+def _hipsparse_fill_mode_enum(lower):
+    return _hipsparse_lookup(
+        "hipsparseFillMode_t",
+        ("HIPSPARSE_FILL_MODE_LOWER",)
+        if lower
+        else ("HIPSPARSE_FILL_MODE_UPPER",),
+    )
+
+
+def _hipsparse_diag_type_enum(unit_diagonal):
+    return _hipsparse_lookup(
+        "hipsparseDiagType_t",
+        ("HIPSPARSE_DIAG_TYPE_UNIT",)
+        if unit_diagonal
+        else ("HIPSPARSE_DIAG_TYPE_NON_UNIT",),
+    )
+
+
+def _hipsparse_call(attr_names, context):
+    for attr_name in attr_names:
+        fn = getattr(hipsparse, attr_name, None) if hipsparse is not None else None
+        if fn is not None:
+            return fn
+    names = ", ".join(attr_names)
+    raise RuntimeError(f"{context} is unavailable: missing {names}")
+
+
+def _hipsparse_enum_storage(enum_value):
+    try:
+        raw_value = int(enum_value)
+    except Exception:
+        raw_value = getattr(enum_value, "value", enum_value)
+    return ctypes.c_int(int(raw_value))
+
+
+def _hipsparse_set_spmat_attribute(spmat, attr_name, enum_value):
+    setter = _hipsparse_call(
+        ("hipsparseSpMatSetAttribute",),
+        "hipsparseSpMatSetAttribute",
+    )
+    attr = _hipsparse_spmat_attribute(attr_name)
+    payload = _hipsparse_enum_storage(enum_value)
+    attempts = (
+        (spmat, attr, payload, ctypes.sizeof(payload)),
+        (spmat, attr, ctypes.byref(payload), ctypes.sizeof(payload)),
+        (spmat, attr, enum_value, ctypes.sizeof(payload)),
+    )
+    last_error = None
+    for args in attempts:
+        try:
+            _hip_check_result(setter(*args), "hipsparseSpMatSetAttribute")
+            return
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(
+        f"hipsparseSpMatSetAttribute({attr_name}) failed: {last_error}"
+    ) from last_error
 
 @dataclass
 class FlagSparseSpSVDescr:
@@ -928,6 +1016,7 @@ def _build_spsv_nnz_balance_launch_order(indptr64, n_rows, *, lower):
 def _supports_spsv_advanced_nontrans_routes(trans_mode, lower, unit_diagonal, value_dtype):
     return (
         trans_mode == "N"
+        and bool(lower)
         and (not bool(unit_diagonal))
         and value_dtype in (torch.float32, torch.float64, torch.complex64, torch.complex128)
     )
@@ -1445,33 +1534,10 @@ def _prepare_spsv_csr_system(
         level_meta = None
         nnz_meta = None
         auto_route = None
-        auto_matrix_stats = base_stats
         if requested_route is None and _supports_spsv_advanced_nontrans_routes(
             "N", lower, unit_diagonal, data.dtype
         ):
-            level_meta = _build_spsv_level_schedule_metadata(
-                indices64,
-                indptr64,
-                n_rows,
-                lower=lower,
-                unit_diagonal=unit_diagonal,
-            )
-            auto_matrix_stats = level_meta["matrix_stats"]
-            auto_route = _choose_spsv_nontrans_auto_route(
-                n_rows,
-                auto_matrix_stats,
-                lower=lower,
-                unit_diagonal=unit_diagonal,
-                value_dtype=data.dtype,
-            )
-            if auto_route == "csr_nnz_balance":
-                nnz_meta = _build_spsv_nnz_balance_metadata(
-                    indices64,
-                    indptr64,
-                    n_rows,
-                    lower=lower,
-                    unit_diagonal=unit_diagonal,
-                )
+            auto_route = "csr_smblk"
 
         effective_route = requested_route if requested_route is not None else auto_route
 
@@ -1506,7 +1572,7 @@ def _prepare_spsv_csr_system(
         elif effective_route == "csr_smblk":
             if bool(unit_diagonal):
                 raise ValueError("solve_kind='csr_smblk' currently supports non-unit diagonal only")
-            matrix_stats = auto_matrix_stats if requested_route is None else base_stats
+            matrix_stats = base_stats
             default_solve_kind = "csr_smblk"
             supported_solve_kinds = ("csr_smblk",)
         elif effective_route == "csr_cw_levelschd":
@@ -1530,7 +1596,7 @@ def _prepare_spsv_csr_system(
                     lower=lower,
                     unit_diagonal=unit_diagonal,
                 )
-            matrix_stats = auto_matrix_stats if requested_route is None else nnz_meta["matrix_stats"]
+            matrix_stats = nnz_meta["matrix_stats"]
             default_solve_kind = "csr_nnz_balance"
             supported_solve_kinds = ("csr_nnz_balance",)
         else:
@@ -1541,7 +1607,7 @@ def _prepare_spsv_csr_system(
                 default_solve_kind = "csr_cw"
                 supported_solve_kinds = ("csr_cw",)
             else:
-                matrix_stats = auto_matrix_stats
+                matrix_stats = base_stats
                 default_solve_kind = auto_route if auto_route is not None else "csr_smblk"
                 supported_solve_kinds = (default_solve_kind,)
         route_name = nontrans_variant
