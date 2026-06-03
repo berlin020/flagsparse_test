@@ -1308,6 +1308,43 @@ def _normalize_requested_spsv_route(solve_kind, trans_mode):
     return route
 
 
+def _csr_transpose(data, indices, indptr, n_rows_or_shape, n_cols=None, conjugate=False):
+    if n_cols is None:
+        n_rows, n_cols = int(n_rows_or_shape[0]), int(n_rows_or_shape[1])
+    else:
+        n_rows, n_cols = int(n_rows_or_shape), int(n_cols)
+    device = data.device
+    if data.numel() == 0:
+        return (
+            data.conj() if conjugate and torch.is_complex(data) else data,
+            torch.empty(0, dtype=torch.int64, device=device),
+            torch.zeros(n_cols + 1, dtype=torch.int64, device=device),
+        )
+
+    indptr64 = indptr.to(torch.int64)
+    row = torch.repeat_interleave(
+        torch.arange(n_rows, device=device, dtype=torch.int64),
+        indptr64[1:] - indptr64[:-1],
+    )
+    col = indices.to(torch.int64)
+    row_t = col
+    col_t = row
+    key = row_t * max(1, n_rows) + col_t
+    try:
+        order = torch.argsort(key, stable=True)
+    except TypeError:
+        order = torch.argsort(key)
+
+    row_t = row_t[order]
+    col_t = col_t[order]
+    data_eff = data.conj() if conjugate and torch.is_complex(data) else data
+    data_t = data_eff[order]
+    nnz_per_row = torch.bincount(row_t, minlength=n_cols)
+    indptr_t = torch.zeros(n_cols + 1, dtype=torch.int64, device=device)
+    indptr_t[1:] = torch.cumsum(nnz_per_row, dim=0)
+    return data_t, col_t.to(torch.int64), indptr_t
+
+
 @triton.jit
 def _spsv_csc_preprocess_kernel(
     indices_ptr,
