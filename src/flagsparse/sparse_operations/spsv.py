@@ -2073,6 +2073,7 @@ def _prepare_spsv_csr_system(
 
         effective_route = requested_route if requested_route is not None else auto_route
 
+        explicit_csr_cw = requested_route == "csr_cw"
         if effective_route == "csr_cw":
             default_solve_kind = "csr_cw"
             matrix_stats = base_stats
@@ -2087,7 +2088,6 @@ def _prepare_spsv_csr_system(
                     n_rows,
                     lower=lower,
                     unit_diagonal=unit_diagonal,
-                    minimal=True,
                 )
             elif int(level_meta["level_ptr32"].numel()) > 1 or int(level_meta["indegree_init32"].numel()) > 0:
                 level_meta = _build_spsv_level_schedule_metadata(
@@ -2096,7 +2096,6 @@ def _prepare_spsv_csr_system(
                     n_rows,
                     lower=lower,
                     unit_diagonal=unit_diagonal,
-                    minimal=True,
                 )
             matrix_stats = level_meta["matrix_stats"]
             default_solve_kind = "csr_roc"
@@ -2122,6 +2121,14 @@ def _prepare_spsv_csr_system(
         elif effective_route == "csr_nnz_balance":
             if nnz_meta is None:
                 nnz_meta = _build_spsv_nnz_balance_metadata(
+                    indices64,
+                    indptr64,
+                    n_rows,
+                    lower=lower,
+                    unit_diagonal=unit_diagonal,
+                )
+            if level_meta is None:
+                level_meta = _build_spsv_level_schedule_metadata(
                     indices64,
                     indptr64,
                     n_rows,
@@ -2163,8 +2170,12 @@ def _prepare_spsv_csr_system(
             "default_block_nnz": default_block_nnz,
             "default_max_segments": default_max_segments,
             "storage_view": "csr",
-            "cw_worker_count": _cw_worker_count(
-                n_rows, matrix_stats["max_frontier"], matrix_stats["avg_nnz_per_row"], 1
+            "cw_worker_count": (
+                1
+                if explicit_csr_cw
+                else _cw_worker_count(
+                    n_rows, matrix_stats["max_frontier"], matrix_stats["avg_nnz_per_row"], 1
+                )
             ),
             "matrix_stats": matrix_stats,
             "route_name": route_name,
@@ -3653,6 +3664,7 @@ def _triton_spsv_csr_n_lo_roc_vector(
     lower=True,
     diag_eps=1e-12,
     ready_in=None,
+    level_ptr=None,
 ):
     x = torch.zeros_like(b_vec)
     ready = ready_in if ready_in is not None else torch.zeros(
@@ -3662,21 +3674,45 @@ def _triton_spsv_csr_n_lo_roc_vector(
     if n_rows == 0:
         return x
     use_fp64_acc = data.dtype == torch.float64
-    _spsv_csr_roc_kernel[(n_rows,)](
-        data,
-        indices,
-        indptr,
-        row_map,
-        b_vec,
-        x,
-        ready,
-        n_rows,
-        LOWER=lower,
-        USE_FP64_ACC=use_fp64_acc,
-        DIAG_EPS=diag_eps,
-        WARP_SIZE=32,
-        num_warps=1,
-    )
+    if level_ptr is not None and int(level_ptr.numel()) > 1:
+        level_ptr_cpu = level_ptr.detach().to("cpu")
+        for level_id in range(int(level_ptr_cpu.numel()) - 1):
+            start = int(level_ptr_cpu[level_id].item())
+            end = int(level_ptr_cpu[level_id + 1].item())
+            count = end - start
+            if count <= 0:
+                continue
+            _spsv_csr_roc_kernel[(count,)](
+                data,
+                indices,
+                indptr,
+                row_map[start:end],
+                b_vec,
+                x,
+                ready,
+                n_rows,
+                LOWER=lower,
+                USE_FP64_ACC=use_fp64_acc,
+                DIAG_EPS=diag_eps,
+                WARP_SIZE=32,
+                num_warps=1,
+            )
+    else:
+        _spsv_csr_roc_kernel[(n_rows,)](
+            data,
+            indices,
+            indptr,
+            row_map,
+            b_vec,
+            x,
+            ready,
+            n_rows,
+            LOWER=lower,
+            USE_FP64_ACC=use_fp64_acc,
+            DIAG_EPS=diag_eps,
+            WARP_SIZE=32,
+            num_warps=1,
+        )
     return x
 
 
@@ -3692,6 +3728,7 @@ def _triton_spsv_csr_n_lo_roc_vector_complex(
     diag_eps=1e-12,
     data_ri_in=None,
     ready_in=None,
+    level_ptr=None,
 ):
     x = torch.zeros_like(b_vec)
     ready = ready_in if ready_in is not None else torch.zeros(
@@ -3705,21 +3742,45 @@ def _triton_spsv_csr_n_lo_roc_vector_complex(
     x_ri = torch.view_as_real(x.contiguous()).reshape(-1).contiguous()
     component_dtype = _component_dtype_for_complex(data.dtype)
     use_fp64 = component_dtype == torch.float64
-    _spsv_csr_roc_kernel_complex[(n_rows,)](
-        data_ri,
-        indices,
-        indptr,
-        row_map,
-        b_ri,
-        x_ri,
-        ready,
-        n_rows,
-        LOWER=lower,
-        USE_FP64_ACC=use_fp64,
-        DIAG_EPS=diag_eps,
-        WARP_SIZE=32,
-        num_warps=1,
-    )
+    if level_ptr is not None and int(level_ptr.numel()) > 1:
+        level_ptr_cpu = level_ptr.detach().to("cpu")
+        for level_id in range(int(level_ptr_cpu.numel()) - 1):
+            start = int(level_ptr_cpu[level_id].item())
+            end = int(level_ptr_cpu[level_id + 1].item())
+            count = end - start
+            if count <= 0:
+                continue
+            _spsv_csr_roc_kernel_complex[(count,)](
+                data_ri,
+                indices,
+                indptr,
+                row_map[start:end],
+                b_ri,
+                x_ri,
+                ready,
+                n_rows,
+                LOWER=lower,
+                USE_FP64_ACC=use_fp64,
+                DIAG_EPS=diag_eps,
+                WARP_SIZE=32,
+                num_warps=1,
+            )
+    else:
+        _spsv_csr_roc_kernel_complex[(n_rows,)](
+            data_ri,
+            indices,
+            indptr,
+            row_map,
+            b_ri,
+            x_ri,
+            ready,
+            n_rows,
+            LOWER=lower,
+            USE_FP64_ACC=use_fp64,
+            DIAG_EPS=diag_eps,
+            WARP_SIZE=32,
+            num_warps=1,
+        )
     return x
 
 
@@ -3813,6 +3874,7 @@ def _triton_spsv_csr_n_lo_cw_levelschd_vector(
     lower=True,
     diag_eps=1e-12,
     ready_in=None,
+    level_ptr=None,
 ):
     x = torch.zeros_like(b_vec)
     ready = ready_in if ready_in is not None else torch.zeros(n_rows, dtype=torch.int32, device=b_vec.device)
@@ -3820,20 +3882,41 @@ def _triton_spsv_csr_n_lo_cw_levelschd_vector(
     if n_rows == 0:
         return x
     use_fp64_acc = data.dtype == torch.float64
-    grid = (n_rows,)
-    _spsv_csr_cw_levelschd_kernel[grid](
-        data,
-        indices,
-        indptr,
-        row_map,
-        b_vec,
-        x,
-        ready,
-        n_rows,
-        USE_FP64_ACC=use_fp64_acc,
-        DIAG_EPS=diag_eps,
-        num_warps=1,
-    )
+    if level_ptr is not None and int(level_ptr.numel()) > 1:
+        level_ptr_cpu = level_ptr.detach().to("cpu")
+        for level_id in range(int(level_ptr_cpu.numel()) - 1):
+            start = int(level_ptr_cpu[level_id].item())
+            end = int(level_ptr_cpu[level_id + 1].item())
+            count = end - start
+            if count <= 0:
+                continue
+            _spsv_csr_cw_levelschd_kernel[(count,)](
+                data,
+                indices,
+                indptr,
+                row_map[start:end],
+                b_vec,
+                x,
+                ready,
+                n_rows,
+                USE_FP64_ACC=use_fp64_acc,
+                DIAG_EPS=diag_eps,
+                num_warps=1,
+            )
+    else:
+        _spsv_csr_cw_levelschd_kernel[(n_rows,)](
+            data,
+            indices,
+            indptr,
+            row_map,
+            b_vec,
+            x,
+            ready,
+            n_rows,
+            USE_FP64_ACC=use_fp64_acc,
+            DIAG_EPS=diag_eps,
+            num_warps=1,
+        )
     return x
 
 
@@ -3849,6 +3932,7 @@ def _triton_spsv_csr_n_lo_cw_levelschd_vector_complex(
     diag_eps=1e-12,
     data_ri_in=None,
     ready_in=None,
+    level_ptr=None,
 ):
     x = torch.zeros_like(b_vec)
     ready = (
@@ -3864,20 +3948,41 @@ def _triton_spsv_csr_n_lo_cw_levelschd_vector_complex(
     x_ri = torch.view_as_real(x.contiguous()).reshape(-1).contiguous()
     component_dtype = _component_dtype_for_complex(data.dtype)
     use_fp64 = component_dtype == torch.float64
-    grid = (n_rows,)
-    _spsv_csr_cw_levelschd_kernel_complex[grid](
-        data_ri,
-        indices,
-        indptr,
-        row_map,
-        b_ri,
-        x_ri,
-        ready,
-        n_rows,
-        USE_FP64_ACC=use_fp64,
-        DIAG_EPS=diag_eps,
-        num_warps=1,
-    )
+    if level_ptr is not None and int(level_ptr.numel()) > 1:
+        level_ptr_cpu = level_ptr.detach().to("cpu")
+        for level_id in range(int(level_ptr_cpu.numel()) - 1):
+            start = int(level_ptr_cpu[level_id].item())
+            end = int(level_ptr_cpu[level_id + 1].item())
+            count = end - start
+            if count <= 0:
+                continue
+            _spsv_csr_cw_levelschd_kernel_complex[(count,)](
+                data_ri,
+                indices,
+                indptr,
+                row_map[start:end],
+                b_ri,
+                x_ri,
+                ready,
+                n_rows,
+                USE_FP64_ACC=use_fp64,
+                DIAG_EPS=diag_eps,
+                num_warps=1,
+            )
+    else:
+        _spsv_csr_cw_levelschd_kernel_complex[(n_rows,)](
+            data_ri,
+            indices,
+            indptr,
+            row_map,
+            b_ri,
+            x_ri,
+            ready,
+            n_rows,
+            USE_FP64_ACC=use_fp64,
+            DIAG_EPS=diag_eps,
+            num_warps=1,
+        )
     return x
 
 
@@ -3895,10 +4000,26 @@ def _triton_spsv_csr_n_lo_nnz_balance_vector(
     tmp_sum_in=None,
     ready_in=None,
     indegree_in=None,
+    indptr=None,
+    level_row_map=None,
+    level_ptr=None,
 ):
     x = torch.zeros_like(b_vec)
     if n_rows == 0:
         return x
+    if indptr is not None and level_row_map is not None and level_ptr is not None:
+        return _triton_spsv_csr_n_lo_cw_levelschd_vector(
+            data,
+            indices,
+            indptr,
+            level_row_map,
+            b_vec,
+            n_rows,
+            lower=lower,
+            diag_eps=diag_eps,
+            ready_in=ready_in,
+            level_ptr=level_ptr,
+        )
     tmp_sum = tmp_sum_in if tmp_sum_in is not None else torch.zeros_like(b_vec)
     ready = ready_in if ready_in is not None else torch.zeros(n_rows, dtype=torch.int32, device=b_vec.device)
     indegree = (
@@ -3945,10 +4066,27 @@ def _triton_spsv_csr_n_lo_nnz_balance_vector_complex(
     tmp_sum_in=None,
     ready_in=None,
     indegree_in=None,
+    indptr=None,
+    level_row_map=None,
+    level_ptr=None,
 ):
     x = torch.zeros_like(b_vec)
     if n_rows == 0:
         return x
+    if indptr is not None and level_row_map is not None and level_ptr is not None:
+        return _triton_spsv_csr_n_lo_cw_levelschd_vector_complex(
+            data,
+            indices,
+            indptr,
+            level_row_map,
+            b_vec,
+            n_rows,
+            lower=lower,
+            diag_eps=diag_eps,
+            data_ri_in=data_ri_in,
+            ready_in=ready_in,
+            level_ptr=level_ptr,
+        )
     tmp_sum = tmp_sum_in if tmp_sum_in is not None else torch.zeros_like(b_vec)
     ready = (
         ready_in
@@ -4537,6 +4675,7 @@ def _execute_spsv_csr_plan(
     lower_eff = solve_plan["lower_eff"]
     matrix_stats = solve_plan.get("matrix_stats", {})
     level_row_map32 = solve_plan.get("level_row_map32")
+    level_ptr32 = solve_plan.get("level_ptr32")
     nnz_balance_row_idx32 = solve_plan.get("nnz_balance_row_idx32")
     nnz_balance_indegree32 = solve_plan.get("nnz_balance_indegree32")
     nnz_balance_launch_order32 = solve_plan.get("nnz_balance_launch_order32")
@@ -4710,6 +4849,7 @@ def _execute_spsv_csr_plan(
                     diag_eps=diag_eps,
                     data_ri_in=complex_kernel_data_ri,
                     ready_in=ready_buf,
+                    level_ptr=level_ptr32,
                     )
                 elif solve_kind == "csr_smblk":
                     x = vec_complex(
@@ -4735,6 +4875,7 @@ def _execute_spsv_csr_plan(
                     diag_eps=diag_eps,
                     data_ri_in=complex_kernel_data_ri,
                     ready_in=ready_buf,
+                    level_ptr=level_ptr32,
                     )
                 elif solve_kind == "csr_nnz_balance":
                     x = vec_complex(
@@ -4751,6 +4892,9 @@ def _execute_spsv_csr_plan(
                     tmp_sum_in=tmp_sum_buf,
                     ready_in=ready_buf,
                     indegree_in=indegree_buf,
+                    indptr=kernel_indptr,
+                    level_row_map=level_row_map32,
+                    level_ptr=level_ptr32,
                     )
                 else:
                     x = vec_complex(
@@ -4799,6 +4943,7 @@ def _execute_spsv_csr_plan(
                 lower=lower_eff,
                 diag_eps=diag_eps,
                 ready_in=ready_buf,
+                level_ptr=level_ptr32,
                 )
             elif solve_kind == "csr_smblk":
                 x = vec_real(
@@ -4822,6 +4967,7 @@ def _execute_spsv_csr_plan(
                 lower=lower_eff,
                 diag_eps=diag_eps,
                 ready_in=ready_buf,
+                level_ptr=level_ptr32,
                 )
             elif solve_kind == "csr_nnz_balance":
                 x = vec_real(
@@ -4837,6 +4983,9 @@ def _execute_spsv_csr_plan(
                 tmp_sum_in=tmp_sum_buf,
                 ready_in=ready_buf,
                 indegree_in=indegree_buf,
+                indptr=kernel_indptr,
+                level_row_map=level_row_map32,
+                level_ptr=level_ptr32,
                 )
             else:
                 x = vec_real(
