@@ -1745,7 +1745,6 @@ def _check_one_csr_transpose_case(path, value_dtype, index_dtype, op_mode, devic
         trans_shape,
         lower=not lower,
         transpose="NON",
-        solve_kind="csr_cw",
     )
     solve_err = (
         float(torch.max(torch.abs(x_op - x_mat)).item()) if x_op.numel() > 0 else 0.0

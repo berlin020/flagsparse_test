@@ -2209,14 +2209,6 @@ def _prepare_spsv_csr_system(
         n_cols,
         conjugate=(trans_mode == "C"),
     )
-    data_t, indices_t64, indptr_t64 = _maybe_sort_csr_rows(
-        data_t,
-        indices_t64,
-        indptr_t64,
-        n_cols,
-        n_rows,
-        lower=lower_eff,
-    )
     matrix_stats = _build_spsv_cw_matrix_stats(indptr_t64, n_cols)
     default_block_nnz, default_max_segments = _auto_spsv_launch_config(
         indptr_t64
