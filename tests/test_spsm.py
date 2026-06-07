@@ -16,7 +16,6 @@ if str(_SRC_ROOT) not in sys.path:
 
 import flagsparse as fs
 import flagsparse.sparse_operations.spsm as fs_spsm_impl
-import flagsparse.sparse_operations.spsv as fs_spsv_impl
 
 try:
     import cupy as cp
@@ -111,6 +110,10 @@ def _sum_ms(*values):
     return sum(values)
 
 
+def _gpu_runtime_available():
+    return torch.cuda.is_available() or fs_spsm_impl._is_rocm_runtime()
+
+
 def _spsm_benchmark_schedule(nnz, n_rhs, value_dtype, fmt="csr"):
     del nnz, n_rhs, value_dtype, fmt
     return int(WARMUP), int(ITERS)
@@ -145,20 +148,25 @@ def _csv_export_row_spsm(row):
         "nnz": row.get("nnz"),
         "n_rhs": row.get("n_rhs"),
         "analysis_ms": row.get("analysis_ms"),
-        "triton_ms": row.get("triton_ms"),
+        "solve_ms": row.get("solve_ms"),
         "triton_total_ms": row.get("triton_total_ms"),
-        "cusparse_ms": row.get("cusparse_ms"),
+        "hipsparse_analysis_ms": row.get("hipsparse_analysis_ms"),
+        "hipsparse_solve_ms": row.get("hipsparse_solve_ms"),
+        "hipsparse_total_ms": row.get("hipsparse_total_ms"),
+        "hipsparse_ms": row.get("hipsparse_ms"),
         "pytorch_ms": row.get("pytorch_ms"),
-        "cusparse_speedup_solve": row.get("cusparse_speedup_solve"),
+        "hipsparse_speedup_solve": row.get("hipsparse_speedup_solve"),
         "pytorch_speedup_solve": row.get("pytorch_speedup_solve"),
-        "cusparse_speedup_total": row.get("cusparse_speedup_total"),
+        "hipsparse_speedup_total": row.get("hipsparse_speedup_total"),
         "pytorch_speedup_total": row.get("pytorch_speedup_total"),
+        "pt_status": row.get("pt_status"),
+        "hs_status": row.get("hs_status"),
         "status": row.get("status"),
         "err_ref": row.get("err_ref"),
         "err_res": row.get("err_res"),
         "err_pt": row.get("err_pt"),
-        "err_cu": row.get("err_cu"),
-        "cusparse_reason": row.get("cusparse_reason"),
+        "err_hs": row.get("err_hs"),
+        "hipsparse_reason": row.get("hipsparse_reason"),
         "pytorch_reason": row.get("pytorch_reason"),
         "error": row.get("error"),
     }
@@ -244,96 +252,9 @@ def _benchmark_pytorch_reference(data, indices, indptr, shape, B):
         return None, None, "unavailable", f"PyTorch sparse solve unavailable ({exc})"
 
 
-def _benchmark_hipsparse_spsv_columns(
-    data,
-    indices,
-    indptr,
-    B,
-    shape,
-    *,
-    lower,
-    unit_diagonal,
-    warmup,
-    iters,
-):
-    """Solve each RHS with one analyzed hipSPARSE SpSV descriptor."""
-    backend, reason = fs_spsv_impl._spsv_csr_sparse_ref_backend(
-        data.dtype,
-        indices.dtype,
-        indptr.dtype,
-        op="non",
-    )
-    if backend != "hipsparse":
-        return None, None, reason or "hipSPARSE SpSV reference unavailable"
-    hipsparse = fs_spsv_impl.hipsparse
-    pointer_type = fs_spsv_impl.HipPointer
-    set_values = getattr(hipsparse, "hipsparseDnVecSetValues", None)
-    if set_values is None:
-        return None, None, "hipSPARSE SpSV-column baseline missing hipsparseDnVecSetValues"
-
-    n_rhs = int(B.shape[1])
-    if n_rhs == 0:
-        return B.new_empty(B.shape), 0.0, None
-
-    # Each row is a contiguous RHS/solution vector for one SpSV call.
-    rhs_columns = B.transpose(0, 1).contiguous()
-    solution_columns = torch.empty_like(rhs_columns)
-    state = None
-    try:
-        state = fs_spsv_impl._prepare_spsv_csr_ref_hipsparse(
-            data,
-            indices,
-            indptr,
-            rhs_columns[0],
-            shape,
-            lower=lower,
-            unit_diagonal=unit_diagonal,
-            op="non",
-            out=solution_columns[0],
-        )
-
-        def run_all_columns():
-            for column in range(n_rhs):
-                fs_spsv_impl._hip_check_result(
-                    set_values(
-                        state["rhs_desc"],
-                        pointer_type.fromObj(rhs_columns[column].data_ptr()),
-                    ),
-                    "hipsparseDnVecSetValues(rhs)",
-                )
-                fs_spsv_impl._hip_check_result(
-                    set_values(
-                        state["sol_desc"],
-                        pointer_type.fromObj(solution_columns[column].data_ptr()),
-                    ),
-                    "hipsparseDnVecSetValues(solution)",
-                )
-                fs_spsv_impl._run_spsv_csr_ref_hipsparse_prepared(state)
-
-        for _ in range(warmup):
-            run_all_columns()
-        torch.cuda.synchronize()
-        times = []
-        for _ in range(iters):
-            start = torch.cuda.Event(True)
-            stop = torch.cuda.Event(True)
-            start.record()
-            run_all_columns()
-            stop.record()
-            stop.synchronize()
-            times.append(start.elapsed_time(stop))
-        result = solution_columns.transpose(0, 1).contiguous()
-        return result, _allinone_filtered_avg_ms(times), None
-    except Exception as exc:
-        return None, None, f"hipSPARSE SpSV-column baseline failed ({exc})"
-    finally:
-        if state is not None:
-            fs_spsv_impl._destroy_spsv_csr_ref_hipsparse_prepared(state)
-
-
-def _benchmark_cusparse_reference(data, row, col, indptr, B, shape, fmt, warmup, iters):
+def _benchmark_sparse_reference(data, row, col, indptr, B, shape, fmt, warmup, iters):
     if fs_spsm_impl._is_rocm_runtime():
-        return _benchmark_hipsparse_spsv_columns(
+        result = fs_spsm_impl._benchmark_spsm_csr_sparse_ref(
             data,
             col,
             indptr,
@@ -344,8 +265,15 @@ def _benchmark_cusparse_reference(data, row, col, indptr, B, shape, fmt, warmup,
             warmup=warmup,
             iters=iters,
         )
+        return (
+            result["values"],
+            result["analysis_ms"],
+            result["solve_ms"],
+            result["total_ms"],
+            result["reason"],
+        )
     if cp is None or cpx_sparse is None or cpx_cusparse is None:
-        return None, None, "cusparse unavailable"
+        return None, None, None, None, "cusparse unavailable"
     try:
         data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data.contiguous()))
         B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(B.contiguous()))
@@ -372,9 +300,9 @@ def _benchmark_cusparse_reference(data, row, col, indptr, B, shape, fmt, warmup,
             times.append(cp.cuda.get_elapsed_time(c0, c1))
         ms = _allinone_filtered_avg_ms(times)
         X_t = torch.utils.dlpack.from_dlpack(X_cp.toDlpack()).to(B.dtype)
-        return X_t, ms, None
+        return X_t, None, ms, ms, None
     except Exception as exc:
-        return None, None, str(exc)
+        return None, None, None, None, str(exc)
 
 
 def _apply_csr_to_dense_rhs(data, indices, indptr, X, shape):
@@ -592,20 +520,34 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
             B,
             shape,
         )
-    X_cu, cusparse_ms, _cusparse_reason = _benchmark_cusparse_reference(
-        data, row, col, indptr, B, shape, fmt, warmup, iters
+    (
+        X_hs,
+        hipsparse_analysis_ms,
+        hipsparse_solve_ms,
+        hipsparse_total_ms,
+        hipsparse_reason,
+    ) = _benchmark_sparse_reference(
+        data,
+        row.to(index_dtype),
+        col.to(index_dtype),
+        indptr.to(index_dtype),
+        B,
+        shape,
+        fmt,
+        warmup,
+        iters,
     )
     X_pt, pytorch_ms, _pt_backend, pytorch_reason = _benchmark_pytorch_reference(
         data, indices, indptr, shape, B
     )
 
-    err_cu = None
-    ok_cu = None
-    rel_cu = None
-    if X_cu is not None:
-        err_cu = float(torch.max(torch.abs(X_fs - X_cu)).item()) if X_fs.numel() else 0.0
-        rel_cu = _reference_max_relative_error(X_cu, X_fs, value_dtype)
-        ok_cu = rel_cu <= _reference_check_threshold(value_dtype)
+    err_hs = None
+    ok_hs = None
+    rel_hs = None
+    if X_hs is not None:
+        err_hs = float(torch.max(torch.abs(X_fs - X_hs)).item()) if X_fs.numel() else 0.0
+        rel_hs = _reference_max_relative_error(X_hs, X_fs, value_dtype)
+        ok_hs = rel_hs <= _reference_check_threshold(value_dtype)
 
     err_pt = None
     ok_pt = None
@@ -616,14 +558,14 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
         ok_pt = rel_pt <= _reference_check_threshold(value_dtype)
 
     err_res, ok_res = _solution_residual_metrics(data, indices, indptr, shape, X_fs, B, value_dtype)
-    ref_errors = [v for v in (err_pt, err_cu) if v is not None]
+    ref_errors = [v for v in (err_pt, err_hs) if v is not None]
     err_ref = min(ref_errors) if ref_errors else None
 
-    if ok_cu is not None:
-        status = "PASS" if ok_cu else "FAIL"
+    if ok_hs is not None:
+        status = "PASS" if ok_hs else "FAIL"
     elif ok_pt is not None:
         status = "PASS" if ok_pt else "FAIL"
-    elif X_pt is None and X_cu is None:
+    elif X_pt is None and X_hs is None:
         status = "REF_FAIL"
     else:
         status = "FAIL"
@@ -635,28 +577,35 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
         "nnz": int(data.numel()),
         "n_rhs": int(n_rhs),
         "analysis_ms": analysis_ms,
-        "triton_ms": solve_ms,
+        "solve_ms": solve_ms,
         "triton_total_ms": _sum_ms(analysis_ms, solve_ms),
-        "cusparse_ms": cusparse_ms,
+        "hipsparse_analysis_ms": hipsparse_analysis_ms,
+        "hipsparse_solve_ms": hipsparse_solve_ms,
+        "hipsparse_total_ms": hipsparse_total_ms,
+        "hipsparse_ms": hipsparse_solve_ms,
         "pytorch_ms": pytorch_ms,
-        "cusparse_speedup_solve": _safe_ratio(cusparse_ms, solve_ms),
+        "hipsparse_speedup_solve": _safe_ratio(hipsparse_solve_ms, solve_ms),
         "pytorch_speedup_solve": _safe_ratio(pytorch_ms, solve_ms),
-        "cusparse_speedup_total": _safe_ratio(cusparse_ms, _sum_ms(analysis_ms, solve_ms)),
+        "hipsparse_speedup_total": _safe_ratio(
+            hipsparse_total_ms, _sum_ms(analysis_ms, solve_ms)
+        ),
         "pytorch_speedup_total": _safe_ratio(pytorch_ms, _sum_ms(analysis_ms, solve_ms)),
+        "pt_status": "PASS" if ok_pt else ("FAIL" if X_pt is not None else "N/A"),
+        "hs_status": "PASS" if ok_hs else ("FAIL" if X_hs is not None else "N/A"),
         "status": status,
         "err_ref": err_ref,
         "err_res": err_res,
         "err_pt": err_pt,
-        "err_cu": err_cu,
-        "cusparse_reason": _cusparse_reason,
+        "err_hs": err_hs,
+        "hipsparse_reason": hipsparse_reason,
         "pytorch_reason": pytorch_reason,
         "error": None,
     }
 
 
 def run_spsm_synthetic_all(n=512, n_rhs=1024):
-    if not torch.cuda.is_available():
-        print("CUDA is not available.")
+    if not _gpu_runtime_available():
+        print("No CUDA or ROCm/DCU runtime is available.")
         return
     total = 0
     failed = 0
@@ -665,8 +614,8 @@ def run_spsm_synthetic_all(n=512, n_rhs=1024):
     print("=" * 160)
     if fs_spsm_impl._is_rocm_runtime():
         print(
-            "Baselines: hipSPARSE SpSV-column solve + PyTorch official sparse solve "
-            "(one SpSV analysis is reused while RHS/output pointers change per column)."
+            "Baselines: hipSPARSE csrsm2 matrix solve + PyTorch official sparse solve "
+            "(csrsm2 analysis is reused across timed matrix-RHS solves)."
         )
     else:
         print(
@@ -677,8 +626,9 @@ def run_spsm_synthetic_all(n=512, n_rhs=1024):
     print(
         f"{'Fmt':>5} {'dtype':>9} {'index':>7} {'N':>6} {'RHS':>6} {'NNZ':>10} "
         f"{'FS.analysis':>11} {'FS.solve':>10} {'FS.total':>10} "
-        f"{'CU.total':>10} {'PT.total':>10} {'CU.spdS':>10} {'PT.spdS':>10} {'CU.spdT':>10} {'PT.spdT':>10} "
-        f"{'Status':>10} {'Err(Ref)':>12} {'Err(Res)':>12} {'Err(PT)':>12} {'Err(CU)':>12}"
+        f"{'HS.analysis':>11} {'HS.solve':>10} {'HS.total':>10} {'PT.total':>10} "
+        f"{'HS.spdS':>10} {'PT.spdS':>10} {'HS.spdT':>10} {'PT.spdT':>10} "
+        f"{'Status':>10} {'Err(Ref)':>12} {'Err(Res)':>12} {'Err(PT)':>12} {'Err(HS)':>12}"
     )
     print("-" * 160)
 
@@ -706,16 +656,17 @@ def run_spsm_synthetic_all(n=512, n_rhs=1024):
                 print(
                     f"{fmt:>5} {_dtype_name(value_dtype):>9} {_dtype_name(index_dtype):>7} "
                     f"{shape[0]:>6} {n_rhs:>6} {one['nnz']:>10} "
-                    f"{_fmt_ms(one['analysis_ms']):>11} {_fmt_ms(one['triton_ms']):>10} {_fmt_ms(one['triton_total_ms']):>10} "
-                    f"{_fmt_ms(one['cusparse_ms']):>10} {_fmt_ms(one['pytorch_ms']):>10} "
-                    f"{_fmt_ratio(one['cusparse_speedup_solve']):>10} {_fmt_ratio(one['pytorch_speedup_solve']):>10} "
-                    f"{_fmt_ratio(one['cusparse_speedup_total']):>10} {_fmt_ratio(one['pytorch_speedup_total']):>10} "
+                    f"{_fmt_ms(one['analysis_ms']):>11} {_fmt_ms(one['solve_ms']):>10} {_fmt_ms(one['triton_total_ms']):>10} "
+                    f"{_fmt_ms(one['hipsparse_analysis_ms']):>11} {_fmt_ms(one['hipsparse_solve_ms']):>10} "
+                    f"{_fmt_ms(one['hipsparse_total_ms']):>10} {_fmt_ms(one['pytorch_ms']):>10} "
+                    f"{_fmt_ratio(one['hipsparse_speedup_solve']):>10} {_fmt_ratio(one['pytorch_speedup_solve']):>10} "
+                    f"{_fmt_ratio(one['hipsparse_speedup_total']):>10} {_fmt_ratio(one['pytorch_speedup_total']):>10} "
                     f"{one['status']:>10} {_fmt_err(one['err_ref']):>12} {_fmt_err(one['err_res']):>12} "
-                    f"{_fmt_err(one['err_pt']):>12} {_fmt_err(one['err_cu']):>12}"
+                    f"{_fmt_err(one['err_pt']):>12} {_fmt_err(one['err_hs']):>12}"
                 )
                 if one["status"] in ("FAIL", "REF_FAIL"):
-                    if one["cusparse_reason"]:
-                        print(f"  NOTE: sparse library baseline unavailable: {one['cusparse_reason']}")
+                    if one["hipsparse_reason"]:
+                        print(f"  NOTE: sparse library baseline unavailable: {one['hipsparse_reason']}")
                     if one["pytorch_reason"]:
                         print(f"  NOTE: {one['pytorch_reason']}")
     print("-" * 160)
@@ -724,8 +675,8 @@ def run_spsm_synthetic_all(n=512, n_rhs=1024):
 
 
 def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
-    if not torch.cuda.is_available():
-        print("CUDA is not available.")
+    if not _gpu_runtime_available():
+        print("No CUDA or ROCm/DCU runtime is available.")
         return
     device = torch.device("cuda")
     rows_out = []
@@ -734,8 +685,8 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
     print("=" * 176)
     if fs_spsm_impl._is_rocm_runtime():
         baseline_text = (
-            "hipSPARSE SpSV-column solve + PyTorch official sparse solve "
-            "(one SpSV analysis reused across RHS columns)"
+            "hipSPARSE csrsm2 matrix solve + PyTorch official sparse solve "
+            "(csrsm2 analysis reused across timed full-RHS solves)"
         )
     else:
         baseline_text = (
@@ -750,14 +701,15 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
     )
     print(
         "PT.total is the aggregated time of one torch.sparse.spsolve call per RHS column; "
-        "CU.total is one official sparse triangular solve call on the full matrix RHS. "
-        "PT.spdS and CU.spdS compare against FS.solve; PT.spdT and CU.spdT compare against FS.total."
+        "HS.analysis/solve/total report hipSPARSE csrsm2 phases on ROCm/DCU. "
+        "PT.spdS and HS.spdS compare against FS.solve; PT.spdT and HS.spdT compare against FS.total."
     )
     print(
         f"{'Matrix':<28} {'dtype':>9} {'index':>7} {'N':>7} {'RHS':>6} {'NNZ':>10} "
         f"{'FS.analysis':>11} {'FS.solve':>10} {'FS.total':>10} "
-        f"{'CU.total':>10} {'PT.total':>10} {'CU.spdS':>10} {'PT.spdS':>10} {'CU.spdT':>10} {'PT.spdT':>10} "
-        f"{'Status':>10} {'Err(Ref)':>12} {'Err(Res)':>12} {'Err(PT)':>12} {'Err(CU)':>12}"
+        f"{'HS.analysis':>11} {'HS.solve':>10} {'HS.total':>10} {'PT.total':>10} "
+        f"{'HS.spdS':>10} {'PT.spdS':>10} {'HS.spdT':>10} {'PT.spdT':>10} "
+        f"{'Status':>10} {'Err(Ref)':>12} {'Err(Res)':>12} {'Err(PT)':>12} {'Err(HS)':>12}"
     )
     print("-" * 176)
 
@@ -796,18 +748,19 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
                     print(
                         f"{short:<28} {base['value_dtype']:>9} {base['index_dtype']:>7} "
                         f"{row['n_rows']:>7} {row['n_rhs']:>6} {row['nnz']:>10} "
-                        f"{_fmt_ms(row['analysis_ms']):>11} {_fmt_ms(row['triton_ms']):>10} {_fmt_ms(row['triton_total_ms']):>10} "
-                        f"{_fmt_ms(row['cusparse_ms']):>10} {_fmt_ms(row['pytorch_ms']):>10} "
-                        f"{_fmt_ratio(row['cusparse_speedup_solve']):>10} {_fmt_ratio(row['pytorch_speedup_solve']):>10} "
-                        f"{_fmt_ratio(row['cusparse_speedup_total']):>10} {_fmt_ratio(row['pytorch_speedup_total']):>10} "
+                        f"{_fmt_ms(row['analysis_ms']):>11} {_fmt_ms(row['solve_ms']):>10} {_fmt_ms(row['triton_total_ms']):>10} "
+                        f"{_fmt_ms(row['hipsparse_analysis_ms']):>11} {_fmt_ms(row['hipsparse_solve_ms']):>10} "
+                        f"{_fmt_ms(row['hipsparse_total_ms']):>10} {_fmt_ms(row['pytorch_ms']):>10} "
+                        f"{_fmt_ratio(row['hipsparse_speedup_solve']):>10} {_fmt_ratio(row['pytorch_speedup_solve']):>10} "
+                        f"{_fmt_ratio(row['hipsparse_speedup_total']):>10} {_fmt_ratio(row['pytorch_speedup_total']):>10} "
                         f"{row['status']:>10} {_fmt_err(row['err_ref']):>12} {_fmt_err(row['err_res']):>12} "
-                        f"{_fmt_err(row['err_pt']):>12} {_fmt_err(row['err_cu']):>12}"
+                        f"{_fmt_err(row['err_pt']):>12} {_fmt_err(row['err_hs']):>12}"
                     )
                     if row["status"] in ("FAIL", "REF_FAIL"):
-                        if row["cusparse_reason"]:
+                        if row["hipsparse_reason"]:
                             print(
                                 "  NOTE: sparse library baseline unavailable: "
-                                f"{row['cusparse_reason']}"
+                                f"{row['hipsparse_reason']}"
                             )
                         if row["pytorch_reason"]:
                             print(f"  NOTE: {row['pytorch_reason']}")
@@ -829,20 +782,25 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
                         "nnz": "ERR",
                         "n_rhs": int(n_rhs),
                         "analysis_ms": None,
-                        "triton_ms": None,
+                        "solve_ms": None,
                         "triton_total_ms": None,
-                        "cusparse_ms": None,
+                        "hipsparse_analysis_ms": None,
+                        "hipsparse_solve_ms": None,
+                        "hipsparse_total_ms": None,
+                        "hipsparse_ms": None,
                         "pytorch_ms": None,
-                        "cusparse_speedup_solve": None,
+                        "hipsparse_speedup_solve": None,
                         "pytorch_speedup_solve": None,
-                        "cusparse_speedup_total": None,
+                        "hipsparse_speedup_total": None,
                         "pytorch_speedup_total": None,
+                        "pt_status": "N/A",
+                        "hs_status": "N/A",
                         "status": status,
                         "err_ref": None,
                         "err_res": None,
                         "err_pt": None,
-                        "err_cu": None,
-                        "cusparse_reason": None,
+                        "err_hs": None,
+                        "hipsparse_reason": None,
                         "pytorch_reason": None,
                         "error": err_msg,
                     }
@@ -868,20 +826,25 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
         "nnz",
         "n_rhs",
         "analysis_ms",
-        "triton_ms",
+        "solve_ms",
         "triton_total_ms",
-        "cusparse_ms",
+        "hipsparse_analysis_ms",
+        "hipsparse_solve_ms",
+        "hipsparse_total_ms",
+        "hipsparse_ms",
         "pytorch_ms",
-        "cusparse_speedup_solve",
+        "hipsparse_speedup_solve",
         "pytorch_speedup_solve",
-        "cusparse_speedup_total",
+        "hipsparse_speedup_total",
         "pytorch_speedup_total",
+        "pt_status",
+        "hs_status",
         "status",
         "err_ref",
         "err_res",
         "err_pt",
-        "err_cu",
-        "cusparse_reason",
+        "err_hs",
+        "hipsparse_reason",
         "pytorch_reason",
         "error",
     ]
@@ -934,10 +897,6 @@ def main():
     args = parser.parse_args()
     WARMUP = max(0, int(args.warmup))
     ITERS = max(1, int(args.iters))
-
-    ops = _parse_ops_filter(args.ops)
-    if any(op != "NON" for op in ops):
-        raise ValueError("SpSM test currently supports only --ops NON/NON_TRANS")
 
     ops = _parse_ops_filter(args.ops)
     if any(op != "NON" for op in ops):
