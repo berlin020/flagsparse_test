@@ -4,12 +4,19 @@
 This is intentionally tiny and verbose. If a benchmark prints only its table
 header and then stalls, run one operation here and the last printed phase shows
 which hipSPARSE wrapper call or synchronization point is hanging.
+
+Use ``--op spsm-api`` to compare Python wrapper exports with libhipsparse
+symbols for generic SpSM, legacy csrsm2/bsrsm2, and SpSV-column fallbacks.
 """
 
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
 import importlib.metadata
+import inspect
+import os
 import pathlib
 import sys
 
@@ -130,6 +137,210 @@ def print_environment() -> None:
             print(f"SpMM alg {fmt}={_common._hipsparse_spmm_algorithm(fmt)}", flush=True)
         except Exception as exc:
             print(f"SpMM alg {fmt}=ERROR {exc.__class__.__name__}: {exc}", flush=True)
+
+
+SPSM_API_GROUPS = {
+    "generic-spsm": (
+        "hipsparseSpSM_createDescr",
+        "hipsparseSpSM_destroyDescr",
+        "hipsparseSpSM_bufferSize",
+        "hipsparseSpSM_analysis",
+        "hipsparseSpSM_solve",
+    ),
+    "generic-spsv-columns": (
+        "hipsparseSpSV_createDescr",
+        "hipsparseSpSV_destroyDescr",
+        "hipsparseSpSV_bufferSize",
+        "hipsparseSpSV_analysis",
+        "hipsparseSpSV_solve",
+        "hipsparseDnVecSetValues",
+    ),
+    "legacy-csrsv2": (
+        "hipsparseCreateCsrsv2Info",
+        "hipsparseDestroyCsrsv2Info",
+        "hipsparseScsrsv2_bufferSize",
+        "hipsparseScsrsv2_analysis",
+        "hipsparseScsrsv2_solve",
+        "hipsparseXcsrsv2_zeroPivot",
+    ),
+    "legacy-csrsm2-f32": (
+        "hipsparseCreateMatDescr",
+        "hipsparseDestroyMatDescr",
+        "hipsparseCreateCsrsm2Info",
+        "hipsparseDestroyCsrsm2Info",
+        "hipsparseScsrsm2_bufferSizeExt",
+        "hipsparseScsrsm2_analysis",
+        "hipsparseScsrsm2_solve",
+        "hipsparseXcsrsm2_zeroPivot",
+    ),
+    "legacy-csrsm2-f64": (
+        "hipsparseDcsrsm2_bufferSizeExt",
+        "hipsparseDcsrsm2_analysis",
+        "hipsparseDcsrsm2_solve",
+    ),
+    "legacy-csrsm2-c64": (
+        "hipsparseCcsrsm2_bufferSizeExt",
+        "hipsparseCcsrsm2_analysis",
+        "hipsparseCcsrsm2_solve",
+    ),
+    "legacy-csrsm2-c128": (
+        "hipsparseZcsrsm2_bufferSizeExt",
+        "hipsparseZcsrsm2_analysis",
+        "hipsparseZcsrsm2_solve",
+    ),
+    "legacy-bsrsm2": (
+        "hipsparseCreateBsrsm2Info",
+        "hipsparseDestroyBsrsm2Info",
+        "hipsparseSbsrsm2_bufferSize",
+        "hipsparseSbsrsm2_analysis",
+        "hipsparseSbsrsm2_solve",
+    ),
+}
+
+
+def _short_doc(obj) -> str:
+    doc = inspect.getdoc(obj) or "<no docstring>"
+    return " ".join(doc.split())[:500]
+
+
+def _probe_python_symbol(hipsparse_module, symbol: str) -> None:
+    if not hasattr(hipsparse_module, symbol):
+        print(f"python {symbol}: MISSING", flush=True)
+        return
+    fn = getattr(hipsparse_module, symbol)
+    try:
+        signature = str(inspect.signature(fn))
+    except Exception as exc:
+        signature = f"<unavailable: {exc.__class__.__name__}: {exc}>"
+    print(f"python {symbol}: PRESENT", flush=True)
+    print(f"  signature: {signature}", flush=True)
+    print(f"  doc: {_short_doc(fn)}", flush=True)
+
+
+def _hipsparse_library_candidates(hipsparse_module):
+    seen = set()
+    candidates = []
+    discovered = ctypes.util.find_library("hipsparse")
+    if discovered:
+        candidates.append(discovered)
+    for directory in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep):
+        if directory:
+            candidates.append(str(pathlib.Path(directory) / "libhipsparse.so"))
+    candidates.extend(
+        (
+            "/opt/rocm/lib/libhipsparse.so",
+            "/opt/rocm/lib64/libhipsparse.so",
+            "/usr/local/lib/libhipsparse.so",
+            "libhipsparse.so",
+            "libhipsparse.so.1",
+        )
+    )
+    module_path = pathlib.Path(getattr(hipsparse_module, "__file__", ""))
+    if module_path:
+        for parent in module_path.parents:
+            candidates.append(str(parent / "libhipsparse.so"))
+    for candidate in candidates:
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            yield candidate
+
+
+def _load_hipsparse_library(hipsparse_module):
+    errors = []
+    for candidate in _hipsparse_library_candidates(hipsparse_module):
+        try:
+            return candidate, ctypes.CDLL(candidate)
+        except OSError as exc:
+            errors.append(f"{candidate}: {exc}")
+    return None, errors
+
+
+def _probe_creator(hipsparse_module, create_name: str, destroy_name: str, ptr_type) -> None:
+    if not hasattr(hipsparse_module, create_name):
+        return
+    create_fn = getattr(hipsparse_module, create_name)
+    destroy_fn = getattr(hipsparse_module, destroy_name, None)
+    created = None
+    print(f"creator {create_name}:", flush=True)
+    try:
+        result = create_fn()
+        print(f"  no-arg result: {result!r}", flush=True)
+        if isinstance(result, tuple) and len(result) >= 2:
+            created = result[1]
+    except Exception as exc:
+        print(f"  no-arg error: {exc.__class__.__name__}: {exc}", flush=True)
+
+    if created is None and ptr_type is not None:
+        for label, use_ref in (("createRef", True), ("pointer object", False)):
+            output = ptr_type()
+            if use_ref and not hasattr(output, "createRef"):
+                continue
+            arg = output.createRef() if use_ref else output
+            try:
+                result = create_fn(arg)
+                print(f"  {label} result: {result!r}; output={output!r}", flush=True)
+                created = output
+                break
+            except Exception as exc:
+                print(f"  {label} error: {exc.__class__.__name__}: {exc}", flush=True)
+
+    if created is not None and destroy_fn is not None:
+        try:
+            result = destroy_fn(created)
+            print(f"  destroy result: {result!r}", flush=True)
+        except Exception as exc:
+            print(f"  destroy error: {exc.__class__.__name__}: {exc}", flush=True)
+
+
+def run_spsm_api_probe() -> None:
+    phase("import hipSPARSE for SpSM API probe")
+    from hip import hipsparse
+
+    ptr_type = None
+    handle = None
+    try:
+        create_result = hipsparse.hipsparseCreate()
+        print(f"hipsparseCreate raw result={create_result!r}", flush=True)
+        if isinstance(create_result, tuple) and len(create_result) >= 2:
+            handle = create_result[1]
+            if handle is not None:
+                ptr_type = type(handle)
+    except Exception as exc:
+        print(f"hipsparseCreate probe failed: {exc.__class__.__name__}: {exc}", flush=True)
+
+    for group, symbols in SPSM_API_GROUPS.items():
+        print(f"\n[{group}]", flush=True)
+        for symbol in symbols:
+            _probe_python_symbol(hipsparse, symbol)
+
+    print("\n[descriptor creators]", flush=True)
+    for create_name, destroy_name in (
+        ("hipsparseSpSM_createDescr", "hipsparseSpSM_destroyDescr"),
+        ("hipsparseSpSV_createDescr", "hipsparseSpSV_destroyDescr"),
+        ("hipsparseCreateMatDescr", "hipsparseDestroyMatDescr"),
+        ("hipsparseCreateCsrsm2Info", "hipsparseDestroyCsrsm2Info"),
+        ("hipsparseCreateCsrsv2Info", "hipsparseDestroyCsrsv2Info"),
+        ("hipsparseCreateBsrsm2Info", "hipsparseDestroyBsrsm2Info"),
+    ):
+        _probe_creator(hipsparse, create_name, destroy_name, ptr_type)
+
+    print("\n[libhipsparse exported symbols]", flush=True)
+    library_name, library = _load_hipsparse_library(hipsparse)
+    if library is None:
+        print("libhipsparse load: FAILED", flush=True)
+        for error in library_name:
+            print(f"  {error}", flush=True)
+    else:
+        print(f"libhipsparse load: {library_name}", flush=True)
+        for group, symbols in SPSM_API_GROUPS.items():
+            present = [symbol for symbol in symbols if hasattr(library, symbol)]
+            print(f"  {group}: {present or 'NONE'}", flush=True)
+
+    if handle is not None and hasattr(hipsparse, "hipsparseDestroy"):
+        try:
+            print(f"hipsparseDestroy result={hipsparse.hipsparseDestroy(handle)!r}", flush=True)
+        except Exception as exc:
+            print(f"hipsparseDestroy error: {exc.__class__.__name__}: {exc}", flush=True)
 
 
 def run_timing_only() -> None:
@@ -339,6 +550,7 @@ def run_scatter() -> None:
 
 
 OPS = {
+    "spsm-api": run_spsm_api_probe,
     "spmv-csr": run_spmv_csr,
     "spmv-coo": run_spmv_coo,
     "spmm-csr": run_spmm_csr,
@@ -369,6 +581,9 @@ def main() -> None:
         run_timing_only()
         return
     if args.op == "env":
+        return
+    if args.op == "spsm-api":
+        run_spsm_api_probe()
         return
     install_call_trace()
     if args.op == "all":

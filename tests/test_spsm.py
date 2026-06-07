@@ -16,6 +16,7 @@ if str(_SRC_ROOT) not in sys.path:
 
 import flagsparse as fs
 import flagsparse.sparse_operations.spsm as fs_spsm_impl
+import flagsparse.sparse_operations.spsv as fs_spsv_impl
 
 try:
     import cupy as cp
@@ -157,6 +158,7 @@ def _csv_export_row_spsm(row):
         "err_res": row.get("err_res"),
         "err_pt": row.get("err_pt"),
         "err_cu": row.get("err_cu"),
+        "cusparse_reason": row.get("cusparse_reason"),
         "pytorch_reason": row.get("pytorch_reason"),
         "error": row.get("error"),
     }
@@ -242,7 +244,106 @@ def _benchmark_pytorch_reference(data, indices, indptr, shape, B):
         return None, None, "unavailable", f"PyTorch sparse solve unavailable ({exc})"
 
 
+def _benchmark_hipsparse_spsv_columns(
+    data,
+    indices,
+    indptr,
+    B,
+    shape,
+    *,
+    lower,
+    unit_diagonal,
+    warmup,
+    iters,
+):
+    """Solve each RHS with one analyzed hipSPARSE SpSV descriptor."""
+    backend, reason = fs_spsv_impl._spsv_csr_sparse_ref_backend(
+        data.dtype,
+        indices.dtype,
+        indptr.dtype,
+        op="non",
+    )
+    if backend != "hipsparse":
+        return None, None, reason or "hipSPARSE SpSV reference unavailable"
+    hipsparse = fs_spsv_impl.hipsparse
+    pointer_type = fs_spsv_impl.HipPointer
+    set_values = getattr(hipsparse, "hipsparseDnVecSetValues", None)
+    if set_values is None:
+        return None, None, "hipSPARSE SpSV-column baseline missing hipsparseDnVecSetValues"
+
+    n_rhs = int(B.shape[1])
+    if n_rhs == 0:
+        return B.new_empty(B.shape), 0.0, None
+
+    # Each row is a contiguous RHS/solution vector for one SpSV call.
+    rhs_columns = B.transpose(0, 1).contiguous()
+    solution_columns = torch.empty_like(rhs_columns)
+    state = None
+    try:
+        state = fs_spsv_impl._prepare_spsv_csr_ref_hipsparse(
+            data,
+            indices,
+            indptr,
+            rhs_columns[0],
+            shape,
+            lower=lower,
+            unit_diagonal=unit_diagonal,
+            op="non",
+            out=solution_columns[0],
+        )
+
+        def run_all_columns():
+            for column in range(n_rhs):
+                fs_spsv_impl._hip_check_result(
+                    set_values(
+                        state["rhs_desc"],
+                        pointer_type.fromObj(rhs_columns[column].data_ptr()),
+                    ),
+                    "hipsparseDnVecSetValues(rhs)",
+                )
+                fs_spsv_impl._hip_check_result(
+                    set_values(
+                        state["sol_desc"],
+                        pointer_type.fromObj(solution_columns[column].data_ptr()),
+                    ),
+                    "hipsparseDnVecSetValues(solution)",
+                )
+                fs_spsv_impl._run_spsv_csr_ref_hipsparse_prepared(state)
+
+        for _ in range(warmup):
+            run_all_columns()
+        torch.cuda.synchronize()
+        times = []
+        for _ in range(iters):
+            start = torch.cuda.Event(True)
+            stop = torch.cuda.Event(True)
+            start.record()
+            run_all_columns()
+            stop.record()
+            stop.synchronize()
+            times.append(start.elapsed_time(stop))
+        result = solution_columns.transpose(0, 1).contiguous()
+        return result, _allinone_filtered_avg_ms(times), None
+    except Exception as exc:
+        return None, None, f"hipSPARSE SpSV-column baseline failed ({exc})"
+    finally:
+        if state is not None:
+            fs_spsv_impl._destroy_spsv_csr_ref_hipsparse_prepared(state)
+
+
 def _benchmark_cusparse_reference(data, row, col, indptr, B, shape, fmt, warmup, iters):
+    if fs_spsm_impl._is_rocm_runtime():
+        return _benchmark_hipsparse_spsv_columns(
+            data,
+            col,
+            indptr,
+            B,
+            shape,
+            lower=True,
+            unit_diagonal=False,
+            warmup=warmup,
+            iters=iters,
+        )
     if cp is None or cpx_sparse is None or cpx_cusparse is None:
         return None, None, "cusparse unavailable"
     try:
@@ -547,6 +648,7 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
         "err_res": err_res,
         "err_pt": err_pt,
         "err_cu": err_cu,
+        "cusparse_reason": _cusparse_reason,
         "pytorch_reason": pytorch_reason,
         "error": None,
     }
@@ -561,11 +663,17 @@ def run_spsm_synthetic_all(n=512, n_rhs=1024):
     print("=" * 160)
     print("FLAGSPARSE SpSM synthetic test")
     print("=" * 160)
-    print(
-        "Baselines: cuSPARSE sparse triangular solve + PyTorch official sparse solve "
-        "(PyTorch aggregates one torch.sparse.spsolve call per RHS column; "
-        "cuSPARSE solves the full matrix RHS in one interface call)."
-    )
+    if fs_spsm_impl._is_rocm_runtime():
+        print(
+            "Baselines: hipSPARSE SpSV-column solve + PyTorch official sparse solve "
+            "(one SpSV analysis is reused while RHS/output pointers change per column)."
+        )
+    else:
+        print(
+            "Baselines: cuSPARSE sparse triangular solve + PyTorch official sparse solve "
+            "(PyTorch aggregates one torch.sparse.spsolve call per RHS column; "
+            "cuSPARSE solves the full matrix RHS in one interface call)."
+        )
     print(
         f"{'Fmt':>5} {'dtype':>9} {'index':>7} {'N':>6} {'RHS':>6} {'NNZ':>10} "
         f"{'FS.analysis':>11} {'FS.solve':>10} {'FS.total':>10} "
@@ -606,6 +714,8 @@ def run_spsm_synthetic_all(n=512, n_rhs=1024):
                     f"{_fmt_err(one['err_pt']):>12} {_fmt_err(one['err_cu']):>12}"
                 )
                 if one["status"] in ("FAIL", "REF_FAIL"):
+                    if one["cusparse_reason"]:
+                        print(f"  NOTE: sparse library baseline unavailable: {one['cusparse_reason']}")
                     if one["pytorch_reason"]:
                         print(f"  NOTE: {one['pytorch_reason']}")
     print("-" * 160)
@@ -622,12 +732,17 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
     fmt = "coo" if use_coo else "csr"
 
     print("=" * 176)
-    print(
-        f"FLAGSPARSE SpSM .mtx batch ({fmt.upper()}) | "
-        "baselines: cuSPARSE sparse triangular solve + PyTorch official sparse solve "
-        "(PyTorch aggregates one torch.sparse.spsolve call per RHS column; "
-        "cuSPARSE solves the full matrix RHS in one interface call)"
-    )
+    if fs_spsm_impl._is_rocm_runtime():
+        baseline_text = (
+            "hipSPARSE SpSV-column solve + PyTorch official sparse solve "
+            "(one SpSV analysis reused across RHS columns)"
+        )
+    else:
+        baseline_text = (
+            "cuSPARSE sparse triangular solve + PyTorch official sparse solve "
+            "(PyTorch calls spsolve per RHS; cuSPARSE solves the full dense RHS)"
+        )
+    print(f"FLAGSPARSE SpSM .mtx batch ({fmt.upper()}) | baselines: {baseline_text}")
     print("=" * 176)
     print(
         f"Benchmark schedule: warmup={WARMUP}, timed_iters={ITERS} "
@@ -689,6 +804,11 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
                         f"{_fmt_err(row['err_pt']):>12} {_fmt_err(row['err_cu']):>12}"
                     )
                     if row["status"] in ("FAIL", "REF_FAIL"):
+                        if row["cusparse_reason"]:
+                            print(
+                                "  NOTE: sparse library baseline unavailable: "
+                                f"{row['cusparse_reason']}"
+                            )
                         if row["pytorch_reason"]:
                             print(f"  NOTE: {row['pytorch_reason']}")
                 except Exception as exc:
@@ -722,6 +842,7 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
                         "err_res": None,
                         "err_pt": None,
                         "err_cu": None,
+                        "cusparse_reason": None,
                         "pytorch_reason": None,
                         "error": err_msg,
                     }
@@ -760,6 +881,7 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
         "err_res",
         "err_pt",
         "err_cu",
+        "cusparse_reason",
         "pytorch_reason",
         "error",
     ]
