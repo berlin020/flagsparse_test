@@ -157,9 +157,14 @@ def _sum_ms(*values):
 
 
 def _gpu_runtime_available():
-    # PyTorch exposes ROCm/DCU devices through the torch.cuda namespace.
-    # Some vendor builds report is_available() incorrectly during early startup.
-    return torch.cuda.is_available() or fs_spsv_impl._is_rocm_runtime()
+    if torch.cuda.is_available():
+        return True
+    print("PyTorch cannot access a CUDA or ROCm/DCU device.")
+    print(f"Python executable: {sys.executable}")
+    print(f"torch version: {torch.__version__}")
+    print(f"torch.version.hip: {getattr(torch.version, 'hip', None)}")
+    print("torch.cuda.is_available(): False")
+    return False
 
 
 def _spsv_benchmark_schedule(nnz, op_mode, value_dtype, fmt="CSR"):
@@ -858,7 +863,6 @@ def _benchmark_sparse_ref_csr_with_op(data, indices, indptr, shape, b, op_mode, 
 
 def run_spsv_synthetic_all(lower=True, alg_num=None):
     if not _gpu_runtime_available():
-        print("No CUDA or ROCm/DCU runtime is available.")
         return
     device = torch.device("cuda")
     sep = "=" * 110
@@ -1343,7 +1347,6 @@ def run_all_supported_spsv_csr_csv(
     alg_num=None,
 ):
     if not _gpu_runtime_available():
-        print("No CUDA or ROCm/DCU runtime is available.")
         return
     device = torch.device("cuda")
     rows_out = []
@@ -1512,7 +1515,6 @@ def run_all_dtypes_spsv_coo_csv(
     alg_num=None,
 ):
     if not _gpu_runtime_available():
-        print("No CUDA or ROCm/DCU runtime is available.")
         return
     device = torch.device("cuda")
     rows_out = []
@@ -1797,7 +1799,6 @@ def run_csr_transpose_check(
     op_modes=None,
 ):
     if not _gpu_runtime_available():
-        print("No CUDA or ROCm/DCU runtime is available.")
         return
     device = torch.device("cuda")
     selected_value_dtypes = value_dtypes or CSR_FULL_VALUE_DTYPES

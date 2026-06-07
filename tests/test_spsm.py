@@ -111,7 +111,14 @@ def _sum_ms(*values):
 
 
 def _gpu_runtime_available():
-    return torch.cuda.is_available() or fs_spsm_impl._is_rocm_runtime()
+    if torch.cuda.is_available():
+        return True
+    print("PyTorch cannot access a CUDA or ROCm/DCU device.")
+    print(f"Python executable: {sys.executable}")
+    print(f"torch version: {torch.__version__}")
+    print(f"torch.version.hip: {getattr(torch.version, 'hip', None)}")
+    print("torch.cuda.is_available(): False")
+    return False
 
 
 def _spsm_benchmark_schedule(nnz, n_rhs, value_dtype, fmt="csr"):
@@ -605,7 +612,6 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
 
 def run_spsm_synthetic_all(n=512, n_rhs=1024):
     if not _gpu_runtime_available():
-        print("No CUDA or ROCm/DCU runtime is available.")
         return
     total = 0
     failed = 0
@@ -676,7 +682,6 @@ def run_spsm_synthetic_all(n=512, n_rhs=1024):
 
 def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
     if not _gpu_runtime_available():
-        print("No CUDA or ROCm/DCU runtime is available.")
         return
     device = torch.device("cuda")
     rows_out = []

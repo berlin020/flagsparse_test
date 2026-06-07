@@ -11,6 +11,9 @@ hip = _common_mod.hip
 hipsparse = _common_mod.hipsparse
 HipPointer = _common_mod.HipPointer
 _hip_check_result = _common_mod._hip_check_result
+_hip_event_elapsed_ms = _common_mod._hip_event_elapsed_ms
+_hip_runtime_event_available = _common_mod._hip_runtime_event_available
+_destroy_hip_event = _common_mod._destroy_hip_event
 _hipsparse_lookup = _common_mod._hipsparse_lookup
 _hipsparse_scalar = _common_mod._hipsparse_scalar
 _hipsparse_unavailable_reason = _common_mod._hipsparse_unavailable_reason
@@ -148,6 +151,34 @@ def _destroy_spsm_csr_ref_hipsparse_prepared(state):
             _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
         except Exception:
             pass
+
+
+def _time_hipsparse_call_ms(call):
+    start_evt = None
+    stop_evt = None
+    if _hip_runtime_event_available():
+        try:
+            start_evt = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(start)")
+            stop_evt = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(stop)")
+            _hip_check_result(hip.hipEventRecord(start_evt, 0), "hipEventRecord(start)")
+            call()
+            _hip_check_result(hip.hipEventRecord(stop_evt, 0), "hipEventRecord(stop)")
+            _hip_check_result(
+                hip.hipEventSynchronize(stop_evt), "hipEventSynchronize(stop)"
+            )
+            return _hip_event_elapsed_ms(start_evt, stop_evt)
+        finally:
+            _destroy_hip_event(stop_evt)
+            _destroy_hip_event(start_evt)
+
+    torch.cuda.synchronize()
+    start_evt_torch = torch.cuda.Event(enable_timing=True)
+    stop_evt_torch = torch.cuda.Event(enable_timing=True)
+    start_evt_torch.record()
+    call()
+    stop_evt_torch.record()
+    torch.cuda.synchronize()
+    return float(start_evt_torch.elapsed_time(stop_evt_torch))
 
 
 def _prepare_spsm_csr_ref_hipsparse(
@@ -304,18 +335,15 @@ def _prepare_spsm_csr_ref_hipsparse(
                 hip.hipMalloc(buffer_size), "hipMalloc(csrsm2 workspace)"
             )
             state["workspace_allocated"] = True
-        analysis_start = torch.cuda.Event(True)
-        analysis_stop = torch.cuda.Event(True)
-        analysis_start.record()
-        _hip_check_result(
-            analysis_fn(*common_args, state["workspace"]),
-            "hipsparseXcsrsm2_analysis",
+        analysis_ms = _time_hipsparse_call_ms(
+            lambda: _hip_check_result(
+                analysis_fn(*common_args, state["workspace"]),
+                "hipsparseXcsrsm2_analysis",
+            )
         )
-        analysis_stop.record()
-        analysis_stop.synchronize()
         state.update(
             {
-                "analysis_ms": float(analysis_start.elapsed_time(analysis_stop)),
+                "analysis_ms": analysis_ms,
                 "buffer_size": buffer_size,
                 "rhs": rhs_col_major,
                 "solution_col_major": solution_col_major,
@@ -415,16 +443,16 @@ def _benchmark_spsm_csr_sparse_ref(
         times = []
         for _ in range(iters):
             state["solution_col_major"].copy_(state["rhs"])
-            start = torch.cuda.Event(True)
-            stop = torch.cuda.Event(True)
-            start.record()
-            _hip_check_result(
-                state["solve_fn"](*state["solve_args"], state["workspace"]),
-                "hipsparseXcsrsm2_solve",
+            times.append(
+                _time_hipsparse_call_ms(
+                    lambda: _hip_check_result(
+                        state["solve_fn"](
+                            *state["solve_args"], state["workspace"]
+                        ),
+                        "hipsparseXcsrsm2_solve",
+                    )
+                )
             )
-            stop.record()
-            stop.synchronize()
-            times.append(float(start.elapsed_time(stop)))
         values = state["solution_col_major"].transpose(0, 1).contiguous()
         analysis_ms = float(state.get("analysis_ms", 0.0))
         solve_ms = sum(times) / len(times) if times else 0.0
