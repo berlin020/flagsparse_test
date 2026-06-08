@@ -1103,7 +1103,7 @@ def _spsm_polling_worker_count(n_rows, n_rhs):
     n_rhs = int(n_rhs)
     if n_rows <= 0:
         return 1
-    target = max(1, min(n_rows, 1024))
+    target = max(1, min(n_rows, 4096))
     if n_rhs >= 16:
         target = max(8, target)
     elif n_rhs >= 8:
@@ -1112,7 +1112,7 @@ def _spsm_polling_worker_count(n_rows, n_rhs):
         target = min(n_rows, 32)
     snapped = 1
     tier = 1
-    while tier < target and tier < 1024:
+    while tier < target and tier < 4096:
         tier *= 2
         if tier <= target:
             snapped = tier
