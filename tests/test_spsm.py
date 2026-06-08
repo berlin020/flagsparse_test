@@ -110,17 +110,6 @@ def _sum_ms(*values):
     return sum(values)
 
 
-def _gpu_runtime_available():
-    if torch.cuda.is_available():
-        return True
-    print("PyTorch cannot access a CUDA or ROCm/DCU device.")
-    print(f"Python executable: {sys.executable}")
-    print(f"torch version: {torch.__version__}")
-    print(f"torch.version.hip: {getattr(torch.version, 'hip', None)}")
-    print("torch.cuda.is_available(): False")
-    return False
-
-
 def _spsm_benchmark_schedule(nnz, n_rhs, value_dtype, fmt="csr"):
     del nnz, n_rhs, value_dtype, fmt
     return int(WARMUP), int(ITERS)
@@ -157,9 +146,6 @@ def _csv_export_row_spsm(row):
         "analysis_ms": row.get("analysis_ms"),
         "solve_ms": row.get("solve_ms"),
         "triton_total_ms": row.get("triton_total_ms"),
-        "hipsparse_analysis_ms": row.get("hipsparse_analysis_ms"),
-        "hipsparse_solve_ms": row.get("hipsparse_solve_ms"),
-        "hipsparse_total_ms": row.get("hipsparse_total_ms"),
         "hipsparse_ms": row.get("hipsparse_ms"),
         "pytorch_ms": row.get("pytorch_ms"),
         "hipsparse_speedup_solve": row.get("hipsparse_speedup_solve"),
@@ -274,13 +260,11 @@ def _benchmark_sparse_reference(data, row, col, indptr, B, shape, fmt, warmup, i
         )
         return (
             result["values"],
-            result["analysis_ms"],
-            result["solve_ms"],
-            result["total_ms"],
+            result["ms"],
             result["reason"],
         )
     if cp is None or cpx_sparse is None or cpx_cusparse is None:
-        return None, None, None, None, "cusparse unavailable"
+        return None, None, "cusparse unavailable"
     try:
         data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data.contiguous()))
         B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(B.contiguous()))
@@ -307,9 +291,9 @@ def _benchmark_sparse_reference(data, row, col, indptr, B, shape, fmt, warmup, i
             times.append(cp.cuda.get_elapsed_time(c0, c1))
         ms = _allinone_filtered_avg_ms(times)
         X_t = torch.utils.dlpack.from_dlpack(X_cp.toDlpack()).to(B.dtype)
-        return X_t, None, ms, ms, None
+        return X_t, ms, None
     except Exception as exc:
-        return None, None, None, None, str(exc)
+        return None, None, str(exc)
 
 
 def _apply_csr_to_dense_rhs(data, indices, indptr, X, shape):
@@ -505,7 +489,6 @@ def _load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
 def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n_rhs, fmt):
     n_rows = int(shape[0])
     B = torch.randn((n_rows, n_rhs), dtype=value_dtype, device=data.device).contiguous()
-    atol, rtol = _tol(value_dtype)
     row, col = _csr_to_coo(indices, indptr, n_rows)
     warmup, iters = _spsm_benchmark_schedule(
         data.numel(), n_rhs, value_dtype, fmt=fmt
@@ -529,9 +512,7 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
         )
     (
         X_hs,
-        hipsparse_analysis_ms,
-        hipsparse_solve_ms,
-        hipsparse_total_ms,
+        hipsparse_ms,
         hipsparse_reason,
     ) = _benchmark_sparse_reference(
         data,
@@ -564,7 +545,9 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
         rel_pt = _reference_max_relative_error(X_pt, X_fs, value_dtype)
         ok_pt = rel_pt <= _reference_check_threshold(value_dtype)
 
-    err_res, ok_res = _solution_residual_metrics(data, indices, indptr, shape, X_fs, B, value_dtype)
+    err_res, _ = _solution_residual_metrics(
+        data, indices, indptr, shape, X_fs, B, value_dtype
+    )
     ref_errors = [v for v in (err_pt, err_hs) if v is not None]
     err_ref = min(ref_errors) if ref_errors else None
 
@@ -586,15 +569,12 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
         "analysis_ms": analysis_ms,
         "solve_ms": solve_ms,
         "triton_total_ms": _sum_ms(analysis_ms, solve_ms),
-        "hipsparse_analysis_ms": hipsparse_analysis_ms,
-        "hipsparse_solve_ms": hipsparse_solve_ms,
-        "hipsparse_total_ms": hipsparse_total_ms,
-        "hipsparse_ms": hipsparse_solve_ms,
+        "hipsparse_ms": hipsparse_ms,
         "pytorch_ms": pytorch_ms,
-        "hipsparse_speedup_solve": _safe_ratio(hipsparse_solve_ms, solve_ms),
+        "hipsparse_speedup_solve": _safe_ratio(hipsparse_ms, solve_ms),
         "pytorch_speedup_solve": _safe_ratio(pytorch_ms, solve_ms),
         "hipsparse_speedup_total": _safe_ratio(
-            hipsparse_total_ms, _sum_ms(analysis_ms, solve_ms)
+            hipsparse_ms, _sum_ms(analysis_ms, solve_ms)
         ),
         "pytorch_speedup_total": _safe_ratio(pytorch_ms, _sum_ms(analysis_ms, solve_ms)),
         "pt_status": "PASS" if ok_pt else ("FAIL" if X_pt is not None else "N/A"),
@@ -611,7 +591,8 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
 
 
 def run_spsm_synthetic_all(n=512, n_rhs=1024):
-    if not _gpu_runtime_available():
+    if not torch.cuda.is_available():
+        print("CUDA/ROCm device is not available.")
         return
     total = 0
     failed = 0
@@ -632,7 +613,7 @@ def run_spsm_synthetic_all(n=512, n_rhs=1024):
     print(
         f"{'Fmt':>5} {'dtype':>9} {'index':>7} {'N':>6} {'RHS':>6} {'NNZ':>10} "
         f"{'FS.analysis':>11} {'FS.solve':>10} {'FS.total':>10} "
-        f"{'HS.analysis':>11} {'HS.solve':>10} {'HS.total':>10} {'PT.total':>10} "
+        f"{'HS.ms':>10} {'PT.total':>10} "
         f"{'HS.spdS':>10} {'PT.spdS':>10} {'HS.spdT':>10} {'PT.spdT':>10} "
         f"{'Status':>10} {'Err(Ref)':>12} {'Err(Res)':>12} {'Err(PT)':>12} {'Err(HS)':>12}"
     )
@@ -663,8 +644,7 @@ def run_spsm_synthetic_all(n=512, n_rhs=1024):
                     f"{fmt:>5} {_dtype_name(value_dtype):>9} {_dtype_name(index_dtype):>7} "
                     f"{shape[0]:>6} {n_rhs:>6} {one['nnz']:>10} "
                     f"{_fmt_ms(one['analysis_ms']):>11} {_fmt_ms(one['solve_ms']):>10} {_fmt_ms(one['triton_total_ms']):>10} "
-                    f"{_fmt_ms(one['hipsparse_analysis_ms']):>11} {_fmt_ms(one['hipsparse_solve_ms']):>10} "
-                    f"{_fmt_ms(one['hipsparse_total_ms']):>10} {_fmt_ms(one['pytorch_ms']):>10} "
+                    f"{_fmt_ms(one['hipsparse_ms']):>10} {_fmt_ms(one['pytorch_ms']):>10} "
                     f"{_fmt_ratio(one['hipsparse_speedup_solve']):>10} {_fmt_ratio(one['pytorch_speedup_solve']):>10} "
                     f"{_fmt_ratio(one['hipsparse_speedup_total']):>10} {_fmt_ratio(one['pytorch_speedup_total']):>10} "
                     f"{one['status']:>10} {_fmt_err(one['err_ref']):>12} {_fmt_err(one['err_res']):>12} "
@@ -681,7 +661,8 @@ def run_spsm_synthetic_all(n=512, n_rhs=1024):
 
 
 def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
-    if not _gpu_runtime_available():
+    if not torch.cuda.is_available():
+        print("CUDA/ROCm device is not available.")
         return
     device = torch.device("cuda")
     rows_out = []
@@ -706,13 +687,13 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
     )
     print(
         "PT.total is the aggregated time of one torch.sparse.spsolve call per RHS column; "
-        "HS.analysis/solve/total report hipSPARSE csrsm2 phases on ROCm/DCU. "
-        "PT.spdS and HS.spdS compare against FS.solve; PT.spdT and HS.spdT compare against FS.total."
+        "HS.ms reports the hipSPARSE csrsm2 baseline on ROCm/DCU. "
+        "HS.spdS/PT.spdS compare against FS.solve; HS.spdT/PT.spdT compare against FS.total."
     )
     print(
         f"{'Matrix':<28} {'dtype':>9} {'index':>7} {'N':>7} {'RHS':>6} {'NNZ':>10} "
         f"{'FS.analysis':>11} {'FS.solve':>10} {'FS.total':>10} "
-        f"{'HS.analysis':>11} {'HS.solve':>10} {'HS.total':>10} {'PT.total':>10} "
+        f"{'HS.ms':>10} {'PT.total':>10} "
         f"{'HS.spdS':>10} {'PT.spdS':>10} {'HS.spdT':>10} {'PT.spdT':>10} "
         f"{'Status':>10} {'Err(Ref)':>12} {'Err(Res)':>12} {'Err(PT)':>12} {'Err(HS)':>12}"
     )
@@ -754,8 +735,7 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
                         f"{short:<28} {base['value_dtype']:>9} {base['index_dtype']:>7} "
                         f"{row['n_rows']:>7} {row['n_rhs']:>6} {row['nnz']:>10} "
                         f"{_fmt_ms(row['analysis_ms']):>11} {_fmt_ms(row['solve_ms']):>10} {_fmt_ms(row['triton_total_ms']):>10} "
-                        f"{_fmt_ms(row['hipsparse_analysis_ms']):>11} {_fmt_ms(row['hipsparse_solve_ms']):>10} "
-                        f"{_fmt_ms(row['hipsparse_total_ms']):>10} {_fmt_ms(row['pytorch_ms']):>10} "
+                        f"{_fmt_ms(row['hipsparse_ms']):>10} {_fmt_ms(row['pytorch_ms']):>10} "
                         f"{_fmt_ratio(row['hipsparse_speedup_solve']):>10} {_fmt_ratio(row['pytorch_speedup_solve']):>10} "
                         f"{_fmt_ratio(row['hipsparse_speedup_total']):>10} {_fmt_ratio(row['pytorch_speedup_total']):>10} "
                         f"{row['status']:>10} {_fmt_err(row['err_ref']):>12} {_fmt_err(row['err_res']):>12} "
@@ -789,9 +769,6 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
                         "analysis_ms": None,
                         "solve_ms": None,
                         "triton_total_ms": None,
-                        "hipsparse_analysis_ms": None,
-                        "hipsparse_solve_ms": None,
-                        "hipsparse_total_ms": None,
                         "hipsparse_ms": None,
                         "pytorch_ms": None,
                         "hipsparse_speedup_solve": None,
@@ -833,9 +810,6 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
         "analysis_ms",
         "solve_ms",
         "triton_total_ms",
-        "hipsparse_analysis_ms",
-        "hipsparse_solve_ms",
-        "hipsparse_total_ms",
         "hipsparse_ms",
         "pytorch_ms",
         "hipsparse_speedup_solve",
