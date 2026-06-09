@@ -37,7 +37,7 @@ SPSM_NON_TRANS_PRIMARY_COMBOS = (
 )
 _SPSM_PREPROCESS_CACHE = OrderedDict()
 _SPSM_PREPROCESS_CACHE_SIZE = 8
-_SPSM_POLLING_RHS_TILE = 1024
+_SPSM_POLLING_RHS_TILE = 32
 
 
 def _hipsparse_csrsm2_functions(value_dtype):
@@ -1261,7 +1261,7 @@ def _run_spsm_csr_core(
         or block_rhs_use > _SPSM_POLLING_RHS_TILE
         or (block_rhs_use & (block_rhs_use - 1)) != 0
     ):
-        raise ValueError("block_rhs must be a power of two in [1, 1024]")
+        raise ValueError("block_rhs must be a power of two in [1, 32]")
     rhs_tiles = triton.cdiv(n_rhs, block_rhs_use)
     worker_count = _spsm_polling_worker_count(n_rows, n_rhs)
     num_warps_use = _spsm_polling_num_warps(block_rhs_use)
